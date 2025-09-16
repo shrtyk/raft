@@ -11,7 +11,7 @@ import (
 
 	"github.com/shrtyk/raft/labrpc"
 	"github.com/shrtyk/raft/raftapi"
-	"github.com/shrtyk/raft/tester1"
+	tester "github.com/shrtyk/raft/tester1"
 )
 
 type Test struct {
@@ -155,7 +155,7 @@ func (ts *Test) checkNoLeader() {
 			if is_leader {
 				details := fmt.Sprintf("leader = %v", i)
 				tester.AnnotateCheckerFailure("unexpected leader found", details)
-				ts.Fatalf(details)
+				ts.Fatalf("%s", details)
 			}
 		}
 	}
@@ -196,7 +196,7 @@ func (ts *Test) nCommitted(index int) (int, any) {
 				text := fmt.Sprintf("committed values at index %v do not match (%v != %v)",
 					index, cmd, cmd1)
 				tester.AnnotateCheckerFailure("unmatched committed values", text)
-				ts.Fatalf(text)
+				ts.Fatalf("%s", text)
 			}
 			count += 1
 			cmd = cmd1

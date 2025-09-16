@@ -5,7 +5,7 @@ import (
 
 	"github.com/shrtyk/raft/kvsrv1/rpc"
 	"github.com/shrtyk/raft/labrpc"
-	"github.com/shrtyk/raft/tester1"
+	tester "github.com/shrtyk/raft/tester1"
 )
 
 type Server struct {
@@ -42,7 +42,12 @@ func makeTest(t *testing.T, nsrv int) *Test {
 	return ts
 }
 
-func (ts *Test) startServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persister *tester.Persister) []tester.IService {
+func (ts *Test) startServer(
+	servers []*labrpc.ClientEnd,
+	gid tester.Tgid,
+	me int,
+	persister *tester.Persister,
+) []tester.IService {
 	ts.s = newSrv()
 	return []tester.IService{ts.s}
 }
