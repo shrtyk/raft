@@ -16,9 +16,17 @@ import (
 	//	"github.com/shrtyk/raft/labgob"
 	"github.com/shrtyk/raft/labrpc"
 	"github.com/shrtyk/raft/raftapi"
-	"github.com/shrtyk/raft/tester1"
+	tester "github.com/shrtyk/raft/tester1"
 )
 
+type State = int32
+
+const (
+	_ State = iota
+	follower
+	candidate
+	leader
+)
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -32,15 +40,60 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	state             State
+	lastLeaderCallAt  time.Time     // last time got leader call
+	lastSleepDuration time.Duration // last sleep duration
+
+	// Persistent state:
+
+	curTerm  int64      // latest term server has seen
+	votedFor *int       // index of peer in peers
+	log      []LogEntry // log entries
+
+	// Volatile state on all servers:
+
+	commitIdx      int // index of highest log entry known to be committed
+	lastAppliedIdx int // index of the highest log entry applied to state machine
+
+	// Volatile state leaders only (reinitialized after election):
+
+	// for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	nextIdx []int
+	// for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+	matchIdx []int
+}
+
+// type for state machine commands
+type cmdType = uint8
+
+const (
+	_ cmdType = iota
+	putCmd
+	getCmd
+)
+
+type Command struct {
+	Type    cmdType
+	Payload []byte
+}
+
+type LogEntry struct {
+	term int     // term when entry was received
+	cmd  Command // command for state machine
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (3A).
+
+	rf.mu.Lock()
+	term = int(rf.curTerm) // potential bug if applicaion will be booted on 32bit systems
+	isleader = rf.state == leader
+	rf.mu.Unlock()
+
 	return term, isleader
 }
 
@@ -61,7 +114,6 @@ func (rf *Raft) persist() {
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
 }
-
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
@@ -90,7 +142,6 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -100,22 +151,50 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	term        int64 // candidate’s term
+	cadidateId  int   // candidate requesting vote
+	lastLogIdx  int   // index of candidate’s last log entry
+	lastLogTerm int   // term of candidate’s last log entry
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	term        int64
+	voteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.lastLeaderCallAt = time.Now()
+	reply.voteGranted = false
+
+	if args.term > rf.curTerm {
+		rf.curTerm = args.term
+		rf.state = follower
+		rf.votedFor = nil
+	}
+
+	if args.term < rf.curTerm {
+		reply.term = rf.curTerm
+		return
+	}
+
+	reply.term = rf.curTerm
+	if rf.votedFor == nil || *rf.votedFor == args.cadidateId {
+		reply.voteGranted = true
+		cid := args.cadidateId
+		rf.votedFor = &cid
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -150,7 +229,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -169,7 +247,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
-
 
 	return index, term, isLeader
 }
@@ -193,16 +270,103 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+type RequestAppendEntriesArgs struct {
+}
+
+type RequestAppendEntriesReply struct {
+}
+
+func (rf *Raft) sendAppendEntries(
+	server int,
+	args *RequestAppendEntriesArgs,
+	reply *RequestAppendEntriesReply,
+) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) startElection(votesChan chan<- bool, stopElection chan<- struct{}) {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		go func(idx int) {
+			lastLogIdx := len(rf.log) - 1
+			lastLogTerm := rf.log[lastLogIdx].term
+			args := &RequestVoteArgs{
+				term:        rf.curTerm,
+				cadidateId:  rf.me,
+				lastLogIdx:  lastLogIdx,
+				lastLogTerm: lastLogTerm,
+			}
+			reply := &RequestVoteReply{}
+			if ok := rf.sendRequestVote(i, args, reply); ok {
+				if reply.term > rf.curTerm {
+					// step back and become follower
+					atomic.StoreInt64(&rf.curTerm, reply.term)
+					atomic.StoreInt32(&rf.state, follower)
+					close(stopElection)
+					return
+				}
+				votesChan <- reply.voteGranted
+			}
+		}(i)
+	}
+}
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
-
+		var majority int64 = int64(len(rf.peers)/2 + 1)
+		var votesCount int32
+		stopElection := make(chan struct{})
+		votes := make(chan bool)
+		switch rf.state {
+		case follower:
+			if time.Since(rf.lastLeaderCallAt) <= rf.lastSleepDuration {
+				break
+			}
+			atomic.SwapInt32(&rf.state, candidate)
+			atomic.AddInt64(&rf.curTerm, 1)
+			fallthrough
+		case candidate:
+			atomic.AddInt32(&votesCount, 1)
+			rf.startElection(votes, stopElection)
+			for {
+				select {
+				case <-stopElection:
+					break
+				case vote, ok := <-votes:
+					if !ok {
+						break
+					}
+					if vote {
+						votesCount++
+						if int64(votesCount) >= majority {
+							atomic.SwapInt32(&rf.state, leader)
+							break
+						}
+					}
+				}
+				break
+			}
+			fallthrough
+		case leader:
+			for i := range rf.peers {
+				rf.sendAppendEntries(i, &RequestAppendEntriesArgs{}, &RequestAppendEntriesReply{})
+			}
+		}
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
+		rf.mu.Lock()
+		rf.lastSleepDuration = time.Duration(ms)
+		rf.mu.Unlock()
+
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -230,7 +394,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
