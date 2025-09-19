@@ -175,7 +175,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.lastLeaderCallAt = time.Now()
 	reply.VoteGranted = false
 
 	if args.Term < rf.curTerm {
@@ -190,8 +189,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.Term = rf.curTerm
-	lastLogTerm := int64(0)
-	lastLogIdx := -1
+	var lastLogTerm int64
+	var lastLogIdx int
 	if len(rf.log) > 0 {
 		lastLogIdx = len(rf.log) - 1
 		lastLogTerm = rf.log[lastLogIdx].Term
@@ -202,6 +201,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		cid := args.CadidateId
 		rf.votedFor = &cid
+		rf.lastLeaderCallAt = time.Now()
 	}
 }
 
@@ -306,19 +306,19 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 	defer rf.mu.Unlock()
 
 	reply.Success = false
+	reply.Term = rf.curTerm
 
 	if args.Term < rf.curTerm {
-		reply.Term = rf.curTerm
 		return
 	}
 
+	rf.state = follower
 	if args.Term > rf.curTerm {
 		rf.curTerm = args.Term
 		rf.votedFor = nil
 	}
 
 	rf.lastLeaderCallAt = time.Now()
-	rf.state = follower
 
 	reply.Success = true
 	reply.Term = rf.curTerm
@@ -477,6 +477,7 @@ func (rf *Raft) ticker() {
 								rf.mu.Unlock()
 								break electionLoop
 							}
+							rf.lastLeaderCallAt = time.Now()
 							rf.mu.Unlock()
 
 							stopElOnce()
@@ -493,6 +494,7 @@ func (rf *Raft) ticker() {
 									rf.mu.Unlock()
 								}
 							}()
+
 							break electionLoop
 						}
 					}
@@ -518,7 +520,7 @@ func (rf *Raft) ticker() {
 					rf.mu.Unlock()
 				}
 			}()
-			time.Sleep(randHeartbeatIntervalMs())
+			time.Sleep(heartbeatIntervalMs())
 		}
 	}
 }
@@ -527,9 +529,8 @@ func randElectionIntervalMs() time.Duration {
 	ms := 50 + (rand.Int63() % 300)
 	return time.Duration(ms) * time.Millisecond
 }
-func randHeartbeatIntervalMs() time.Duration {
-	ms := 25 + (rand.Int63() % 100)
-	return time.Duration(ms) * time.Millisecond
+func heartbeatIntervalMs() time.Duration {
+	return 30 * time.Millisecond
 }
 
 // the service or tester wants to create a Raft server. the ports
