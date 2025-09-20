@@ -201,6 +201,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastLogIdx = len(rf.log) - 1
 		lastLogTerm = rf.log[lastLogIdx].Term
 	}
+
 	logIsUpToDate := args.LastLogTerm > lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIdx >= lastLogIdx)
 	if (rf.votedFor == nil || *rf.votedFor == args.CandidateId) && logIsUpToDate {
@@ -261,6 +262,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
+	rf.mu.Lock()
+	isLeader = rf.state == leader
+	term = int(rf.curTerm)
+	rf.mu.Unlock()
 
 	return index, term, isLeader
 }
@@ -381,6 +386,7 @@ func (rf *Raft) countVotes(repliesChan <-chan *RequestVoteReply) {
 				rf.curTerm = reply.Term
 				rf.state = follower
 				rf.votedFor = nil
+				rf.lastLeaderCallAt = time.Now()
 				rf.mu.Unlock()
 				return
 			} else if reply.VoteGranted && rf.state == candidate {
