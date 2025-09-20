@@ -8,6 +8,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,10 @@ import (
 	"github.com/shrtyk/raft/labrpc"
 	"github.com/shrtyk/raft/raftapi"
 	tester "github.com/shrtyk/raft/tester1"
+)
+
+const (
+	RPCTimeout = 500 * time.Millisecond
 )
 
 type State = int32
@@ -156,7 +161,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
 	Term        int64 // candidate’s term
-	CadidateId  int   // candidate requesting vote
+	CandidateId int   // candidate requesting vote
 	LastLogIdx  int   // index of candidate’s last log entry
 	LastLogTerm int64 // term of candidate’s last log entry
 }
@@ -189,6 +194,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.Term = rf.curTerm
+
 	var lastLogTerm int64
 	var lastLogIdx int
 	if len(rf.log) > 0 {
@@ -197,9 +203,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	logIsUpToDate := args.LastLogTerm > lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIdx >= lastLogIdx)
-	if (rf.votedFor == nil || *rf.votedFor == args.CadidateId) && logIsUpToDate {
+	if (rf.votedFor == nil || *rf.votedFor == args.CandidateId) && logIsUpToDate {
 		reply.VoteGranted = true
-		cid := args.CadidateId
+		cid := args.CandidateId
 		rf.votedFor = &cid
 		rf.lastLeaderCallAt = time.Now()
 	}
@@ -324,79 +330,80 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 	reply.Term = rf.curTerm
 }
 
-func (rf *Raft) startElection(votesChan chan<- bool, stopElection chan struct{}) {
-	var wg sync.WaitGroup
-	wg.Add(len(rf.peers) - 1)
-	stopElOnce := sync.OnceFunc(func() {
-		close(stopElection)
-	})
-	go func() {
-		wg.Wait()
-		close(votesChan)
-	}()
+func (rf *Raft) startElection() {
+	var lastLogIdx int
+	var lastLogTerm int64
+
+	rf.mu.Lock()
+	rf.curTerm++
+	rf.votedFor = &rf.me
+	if len(rf.log) > 0 {
+		lastLogIdx = len(rf.log) - 1
+		lastLogTerm = rf.log[lastLogIdx].Term
+	}
+	currentTerm := rf.curTerm
+	rf.lastLeaderCallAt = time.Now()
+	rf.mu.Unlock()
+
+	repliesChan := make(chan *RequestVoteReply, len(rf.peers)-1)
+	args := &RequestVoteArgs{
+		Term:        currentTerm,
+		CandidateId: rf.me,
+		LastLogIdx:  lastLogIdx,
+		LastLogTerm: lastLogTerm,
+	}
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 		go func(idx int) {
-			defer wg.Done()
-			var lastLogIdx int
-			var lastLogTerm int64
-
-			rf.mu.Lock()
-			if len(rf.log) > 0 {
-				lastLogIdx = len(rf.log) - 1
-				lastLogTerm = rf.log[lastLogIdx].Term
-			}
-			currentTerm := rf.curTerm
-			rf.mu.Unlock()
-
-			args := &RequestVoteArgs{
-				Term:        currentTerm,
-				CadidateId:  rf.me,
-				LastLogIdx:  lastLogIdx,
-				LastLogTerm: lastLogTerm,
-			}
 			reply := &RequestVoteReply{}
 			if rf.sendRequestVote(idx, args, reply) {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-
-				if rf.state != candidate || rf.curTerm != currentTerm {
-					return
-				}
-				if reply.Term > rf.curTerm {
-					// step back and become follower
-					rf.curTerm = reply.Term
-					rf.state = follower
-					rf.votedFor = nil
-					stopElOnce()
-					return
-				}
-				if reply.VoteGranted {
-					select {
-					case votesChan <- true:
-					case <-stopElection:
-						return
-					}
-				}
+				repliesChan <- reply
 			}
 		}(i)
 	}
+	go rf.countVotes(repliesChan)
 }
 
-func (rf *Raft) startHeartbeat(repliesChan chan<- *RequestAppendEntriesReply) {
+func (rf *Raft) countVotes(repliesChan <-chan *RequestVoteReply) {
+	votes := 1
+	majority := len(rf.peers)/2 + 1
+
+	for {
+		select {
+		case <-time.After(RPCTimeout):
+			return
+		case reply := <-repliesChan:
+			rf.mu.Lock()
+			if reply.Term > rf.curTerm {
+				// step back and become follower
+				rf.curTerm = reply.Term
+				rf.state = follower
+				rf.votedFor = nil
+				rf.mu.Unlock()
+				return
+			} else if reply.VoteGranted && rf.state == candidate {
+				votes++
+				if votes >= majority {
+					rf.state = leader
+					rf.mu.Unlock()
+					go rf.startHeartbeat()
+					return
+				}
+			}
+			rf.mu.Unlock()
+		}
+	}
+}
+
+func (rf *Raft) startHeartbeat() {
 	rf.mu.Lock()
 	curTerm := rf.curTerm
 	rf.lastLeaderCallAt = time.Now()
 	rf.mu.Unlock()
 
-	var wg sync.WaitGroup
-	wg.Add(len(rf.peers) - 1)
-	go func() {
-		wg.Wait()
-		close(repliesChan)
-	}()
+	repliesChan := make(chan *RequestAppendEntriesReply, len(rf.peers)-1)
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -412,8 +419,21 @@ func (rf *Raft) startHeartbeat(repliesChan chan<- *RequestAppendEntriesReply) {
 			if rf.sendAppendEntries(idx, args, reply) {
 				repliesChan <- reply
 			}
-			wg.Done()
 		}(i)
+	}
+	go rf.readHeartbeatReplies(repliesChan)
+}
+
+func (rf *Raft) readHeartbeatReplies(repliesChan <-chan *RequestAppendEntriesReply) {
+	for {
+		select {
+		case <-time.After(RPCTimeout):
+			return
+		case reply := <-repliesChan:
+			if reply.Success {
+				// Should be ok to leave empty for 3A part
+			}
+		}
 	}
 }
 
@@ -422,21 +442,12 @@ func (rf *Raft) ticker() {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
-		var majority int64 = int64(len(rf.peers)/2 + 1)
-		var votesCount int32
-		stopElection := make(chan struct{})
-		votes := make(chan bool)
-		stopElOnce := sync.OnceFunc(func() {
-			close(stopElection)
-		})
 		rf.mu.Lock()
 		state := rf.state
 		rf.mu.Unlock()
 
 		switch state {
 		case follower:
-			// pause for a random amount of time between 50 and 350
-			// milliseconds.
 			timeout := randElectionIntervalMs()
 			time.Sleep(timeout)
 
@@ -446,81 +457,15 @@ func (rf *Raft) ticker() {
 			}
 			rf.mu.Unlock()
 		case candidate:
-			rf.mu.Lock()
-			rf.curTerm++
-			rf.votedFor = &rf.me
-			rf.lastLeaderCallAt = time.Now()
-			votesCount++
-			rf.mu.Unlock()
+			go rf.startElection()
 
-			rf.startElection(votes, stopElection)
-		electionLoop:
-			for {
-				select {
-				case <-stopElection:
-					rf.mu.Lock()
-					rf.state = follower
-					rf.mu.Unlock()
-					break electionLoop
-				case vote, ok := <-votes:
-					if !ok {
-						break electionLoop
-					}
-					if vote {
-						votesCount++
-						if int64(votesCount) >= majority {
-							rf.mu.Lock()
-							if rf.state == candidate {
-								rf.state = leader
-							}
-							if rf.state != leader {
-								rf.mu.Unlock()
-								break electionLoop
-							}
-							rf.lastLeaderCallAt = time.Now()
-							rf.mu.Unlock()
-
-							stopElOnce()
-							repliesChan := make(chan *RequestAppendEntriesReply)
-							go rf.startHeartbeat(repliesChan)
-							go func() {
-								for reply := range repliesChan {
-									rf.mu.Lock()
-									if reply.Term > rf.curTerm {
-										rf.curTerm = reply.Term
-										rf.state = follower
-										rf.votedFor = nil
-									}
-									rf.mu.Unlock()
-								}
-							}()
-
-							break electionLoop
-						}
-					}
-				}
-			}
-			rf.mu.Lock()
-			isCandidate := rf.state == candidate
-			rf.mu.Unlock()
-			if isCandidate {
-				time.Sleep(randElectionIntervalMs())
-			}
+			timeout := randElectionIntervalMs()
+			time.Sleep(timeout)
 		case leader:
-			repliesChan := make(chan *RequestAppendEntriesReply)
-			go rf.startHeartbeat(repliesChan)
-			go func() {
-				for reply := range repliesChan {
-					rf.mu.Lock()
-					if reply.Term > rf.curTerm {
-						rf.curTerm = reply.Term
-						rf.state = follower
-						rf.votedFor = nil
-					}
-					rf.mu.Unlock()
-				}
-			}()
-			time.Sleep(heartbeatIntervalMs())
+			go rf.startHeartbeat()
+
+			timeout := heartbeatIntervalMs()
+			time.Sleep(timeout)
 		}
 	}
 }
