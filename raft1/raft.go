@@ -373,13 +373,14 @@ func (rf *Raft) startElection() {
 	go rf.countVotes(repliesChan)
 }
 
-func (rf *Raft) countVotes(repliesChan <-chan *RequestVoteReply) {
+func (rf *Raft) countVotes(repliesChan chan *RequestVoteReply) {
 	votes := 1
 	majority := len(rf.peers)/2 + 1
 
 	for {
 		select {
 		case <-time.After(RPCTimeout):
+			close(repliesChan)
 			return
 		case reply := <-repliesChan:
 			rf.mu.Lock()
@@ -432,10 +433,11 @@ func (rf *Raft) startHeartbeat() {
 	go rf.readHeartbeatReplies(repliesChan)
 }
 
-func (rf *Raft) readHeartbeatReplies(repliesChan <-chan *RequestAppendEntriesReply) {
+func (rf *Raft) readHeartbeatReplies(repliesChan chan *RequestAppendEntriesReply) {
 	for {
 		select {
 		case <-time.After(RPCTimeout):
+			close(repliesChan)
 			return
 		case reply := <-repliesChan:
 			if reply.Success {
