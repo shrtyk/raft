@@ -34,6 +34,10 @@ const (
 	leader
 )
 
+const (
+	votedForNone = -1
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -52,7 +56,7 @@ type Raft struct {
 	// Persistent state:
 
 	curTerm  int64      // latest term server has seen
-	votedFor *int       // index of peer in peers
+	votedFor int        // index of peer in peers
 	log      []LogEntry // log entries
 
 	// Volatile state on all servers:
@@ -190,11 +194,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.curTerm {
 		rf.curTerm = args.Term
 		rf.state = follower
-		rf.votedFor = nil
+		rf.votedFor = votedForNone
 	}
 
 	reply.Term = rf.curTerm
-
 	var lastLogTerm int64
 	var lastLogIdx int
 	if len(rf.log) > 0 {
@@ -204,10 +207,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	logIsUpToDate := args.LastLogTerm > lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIdx >= lastLogIdx)
-	if (rf.votedFor == nil || *rf.votedFor == args.CandidateId) && logIsUpToDate {
+	if args.Term == rf.curTerm && logIsUpToDate && rf.votedFor == votedForNone {
 		reply.VoteGranted = true
-		cid := args.CandidateId
-		rf.votedFor = &cid
+		rf.votedFor = args.CandidateId
 		rf.lastLeaderCallAt = time.Now()
 	}
 }
@@ -326,7 +328,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 	rf.state = follower
 	if args.Term > rf.curTerm {
 		rf.curTerm = args.Term
-		rf.votedFor = nil
+		rf.votedFor = votedForNone
 	}
 
 	rf.lastLeaderCallAt = time.Now()
@@ -341,7 +343,7 @@ func (rf *Raft) startElection() {
 
 	rf.mu.Lock()
 	rf.curTerm++
-	rf.votedFor = &rf.me
+	rf.votedFor = rf.me
 	if len(rf.log) > 0 {
 		lastLogIdx = len(rf.log) - 1
 		lastLogTerm = rf.log[lastLogIdx].Term
@@ -382,10 +384,10 @@ func (rf *Raft) countVotes(repliesChan <-chan *RequestVoteReply) {
 		case reply := <-repliesChan:
 			rf.mu.Lock()
 			if reply.Term > rf.curTerm {
-				// step back and become follower
+				// step down and become follower
 				rf.curTerm = reply.Term
 				rf.state = follower
-				rf.votedFor = nil
+				rf.votedFor = votedForNone
 				rf.lastLeaderCallAt = time.Now()
 				rf.mu.Unlock()
 				return
@@ -468,7 +470,7 @@ func (rf *Raft) ticker() {
 			timeout := randElectionIntervalMs()
 			time.Sleep(timeout)
 		case leader:
-			go rf.startHeartbeat()
+			rf.startHeartbeat()
 
 			timeout := heartbeatIntervalMs()
 			time.Sleep(timeout)
@@ -502,6 +504,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.state = follower
+	rf.votedFor = votedForNone
 	rf.lastLeaderCallAt = time.Now()
 	rf.log = make([]LogEntry, 0)
 	rf.nextIdx = make([]int, len(peers))
