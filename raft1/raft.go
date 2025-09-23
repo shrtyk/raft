@@ -70,8 +70,6 @@ type Raft struct {
 	nextIdx []int
 	// for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 	matchIdx []int
-	// votes in current turm if candidate/leader
-	votes []bool
 }
 
 // type for state machine commands
@@ -353,7 +351,6 @@ func (rf *Raft) startElection() {
 		lastLogTerm = rf.log[lastLogIdx].Term
 	}
 	currentTerm := rf.curTerm
-	rf.votes = make([]bool, len(rf.peers))
 	rf.lastLeaderCallAt = time.Now()
 	rf.mu.Unlock()
 
@@ -378,20 +375,19 @@ func (rf *Raft) startElection() {
 	go rf.countVotes(repliesChan)
 }
 
-func (rf *Raft) isEnoughVotes() bool {
-	var votes int
-	for _, voted := range rf.votes {
+func (rf *Raft) isEnoughVotes(votes []bool) bool {
+	var v int
+	for _, voted := range votes {
 		if voted {
-			votes++
+			v++
 		}
 	}
-	return votes >= len(rf.peers)/2+1
+	return v >= len(rf.peers)/2+1
 }
 
 func (rf *Raft) countVotes(repliesChan chan *RequestVoteReply) {
-	rf.mu.Lock()
-	rf.votes[rf.me] = true
-	rf.mu.Unlock()
+	votes := make([]bool, len(rf.peers))
+	votes[rf.me] = true
 
 	for {
 		select {
@@ -409,8 +405,8 @@ func (rf *Raft) countVotes(repliesChan chan *RequestVoteReply) {
 				rf.mu.Unlock()
 				return
 			} else if reply.VoteGranted && rf.state == candidate {
-				rf.votes[reply.VoterId] = true
-				if rf.isEnoughVotes() {
+				votes[reply.VoterId] = true
+				if rf.isEnoughVotes(votes) {
 					rf.state = leader
 					rf.mu.Unlock()
 					go rf.startHeartbeat()
@@ -527,7 +523,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = make([]LogEntry, 0)
 	rf.nextIdx = make([]int, len(peers))
 	rf.matchIdx = make([]int, len(peers))
-	rf.votes = make([]bool, len(peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
