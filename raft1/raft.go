@@ -7,14 +7,13 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	//	"bytes"
-
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"github.com/shrtyk/raft/labgob"
+	"github.com/shrtyk/raft/labgob"
 
 	"github.com/shrtyk/raft/labrpc"
 	"github.com/shrtyk/raft/raftapi"
@@ -73,18 +72,7 @@ type Raft struct {
 }
 
 // type for state machine commands
-type cmdType = uint8
-
-const (
-	_ cmdType = iota
-	putCmd
-	getCmd
-)
-
-type Command struct {
-	Type    cmdType
-	Payload []byte
-}
+type Command []byte
 
 type LogEntry struct {
 	Term int64   // term when entry was received
@@ -219,8 +207,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 type RequestAppendEntriesArgs struct {
 	Term            int64      // leader term
 	LeaderId        int        // for riderection
-	PrevLogTerm     int64      // index of log entry immidiately preceding new ones
-	PrevLogIdx      int        // term of prevLogIdx entry
+	PrevLogTerm     int64      // term of prevLogIdx entry
+	PrevLogIdx      int        // index of log entry immidiately preceding new ones
 	LeaderCommitIdx int        // leader's commit index
 	Entries         []LogEntry // log entries to store (empty for heartbeat)
 }
@@ -230,27 +218,48 @@ type RequestAppendEntriesReply struct {
 	Success bool  // true if follower contained entry matching prevLogIdx and prevLogTerm
 }
 
-func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
+func (rf *Raft) AppendEntriesRPC(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	reply.Success = false
 	reply.Term = rf.curTerm
 
-	if args.Term < rf.curTerm {
-		return
-	}
-
-	rf.state = follower
 	if args.Term > rf.curTerm {
 		rf.curTerm = args.Term
 		rf.votedFor = votedForNone
 	}
 
-	rf.lastLeaderCallAt = time.Now()
+	if args.Term == rf.curTerm {
+		rf.state = follower
+	}
 
-	reply.Success = true
-	reply.Term = rf.curTerm
+	logOk := (len(rf.log)-1 >= args.PrevLogIdx) &&
+		(args.PrevLogIdx == 0 || rf.log[args.PrevLogIdx].Term == args.PrevLogTerm)
+	if args.Term == rf.curTerm && logOk {
+		// TODO: Append entries
+		rf.appendEntries(args.PrevLogIdx, args.LeaderCommitIdx, args.Entries)
+		reply.Success = true
+	}
+	rf.lastLeaderCallAt = time.Now()
+}
+
+func (rf *Raft) appendEntries(prevLogIdx, commitIdx int, entries []LogEntry) {
+	if len(entries) > 0 && len(rf.log) > prevLogIdx+1 {
+		idx := min(len(rf.log), prevLogIdx+len(entries)+1) - 1
+		if rf.log[idx].Term != entries[idx-prevLogIdx+1].Term {
+			rf.log = rf.log[:prevLogIdx+1]
+		}
+	}
+
+	if prevLogIdx+1+len(entries) > len(rf.log) {
+		rf.log = append(rf.log, entries...)
+	}
+
+	if commitIdx > rf.commitIdx {
+		// TODO: keep persistent and commit to an application
+		rf.commitIdx = commitIdx
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -285,12 +294,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendAppendEntries(
+func (rf *Raft) sendAppendEntriesRPC(
 	server int,
 	args *RequestAppendEntriesArgs,
 	reply *RequestAppendEntriesReply,
 ) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	ok := rf.peers[server].Call("Raft.AppendEntriesRPC", args, reply)
 	return ok
 }
 
@@ -313,9 +322,26 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 	rf.mu.Lock()
-	isLeader = rf.state == leader
+
 	term = int(rf.curTerm)
+	isLeader = rf.state == leader
+	if !isLeader {
+		rf.mu.Unlock()
+		// TODO: redirect to leader node
+		return index, term, isLeader
+	}
+
+	buf := bytes.Buffer{}
+	labgob.NewEncoder(&buf).Encode(command)
+	rf.log = append(rf.log, LogEntry{
+		Term: rf.curTerm,
+		Cmd:  buf.Bytes(),
+	})
+	rf.commitIdx = len(rf.log) - 1
+	rf.matchIdx[rf.me] = len(rf.log) - 1
 	rf.mu.Unlock()
+
+	rf.replicateLog()
 
 	return index, term, isLeader
 }
@@ -408,8 +434,15 @@ func (rf *Raft) countVotes(repliesChan chan *RequestVoteReply) {
 				votes[reply.VoterId] = true
 				if rf.isEnoughVotes(votes) {
 					rf.state = leader
+					for i := range rf.peers {
+						if i == rf.me {
+							continue
+						}
+						rf.nextIdx[i] = len(rf.log)
+						rf.matchIdx[i] = 0
+					}
 					rf.mu.Unlock()
-					go rf.startHeartbeat()
+					go rf.replicateLog()
 					return
 				}
 			}
@@ -418,9 +451,19 @@ func (rf *Raft) countVotes(repliesChan chan *RequestVoteReply) {
 	}
 }
 
-func (rf *Raft) startHeartbeat() {
+func (rf *Raft) replicateLog() {
+	var lastLogIdx int
+	var lastLogTerm int64
+	var entries []LogEntry
+
 	rf.mu.Lock()
 	curTerm := rf.curTerm
+	if len(rf.log) > 0 {
+		lastLogIdx = len(rf.log) - 1
+		lastLogTerm = rf.log[lastLogIdx].Term
+		entries = rf.log[rf.commitIdx+1:]
+	}
+	commitIdx := rf.commitIdx
 	rf.lastLeaderCallAt = time.Now()
 	rf.mu.Unlock()
 
@@ -429,23 +472,25 @@ func (rf *Raft) startHeartbeat() {
 		if i == rf.me {
 			continue
 		}
-
 		go func(idx int) {
 			args := &RequestAppendEntriesArgs{
-				Term:     curTerm,
-				LeaderId: rf.me,
-				Entries:  make([]LogEntry, 0),
+				Term:            curTerm,
+				LeaderId:        rf.me,
+				PrevLogTerm:     lastLogTerm,
+				PrevLogIdx:      lastLogIdx,
+				LeaderCommitIdx: commitIdx,
+				Entries:         entries,
 			}
 			reply := &RequestAppendEntriesReply{}
-			if rf.sendAppendEntries(idx, args, reply) {
+			if rf.sendAppendEntriesRPC(idx, args, reply) {
 				repliesChan <- reply
 			}
 		}(i)
 	}
-	go rf.readHeartbeatReplies(repliesChan)
+	go rf.readAppendLogReplies(repliesChan)
 }
 
-func (rf *Raft) readHeartbeatReplies(repliesChan chan *RequestAppendEntriesReply) {
+func (rf *Raft) readAppendLogReplies(repliesChan chan *RequestAppendEntriesReply) {
 	for {
 		select {
 		case <-time.After(RPCTimeout):
@@ -484,7 +529,7 @@ func (rf *Raft) ticker() {
 			timeout := randElectionIntervalMs()
 			time.Sleep(timeout)
 		case leader:
-			rf.startHeartbeat()
+			rf.replicateLog()
 
 			timeout := heartbeatIntervalMs()
 			time.Sleep(timeout)
