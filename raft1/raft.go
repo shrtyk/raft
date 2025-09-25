@@ -230,23 +230,9 @@ func (rf *Raft) AppendEntriesRPC(args *RequestAppendEntriesArgs, reply *RequestA
 	reply.Term = rf.curTerm
 	rf.lastLeaderCallAt = time.Now()
 
-	if args.PrevLogIdx != -1 &&
-		(args.PrevLogIdx >= len(rf.log) || rf.log[args.PrevLogIdx].Term != args.PrevLogTerm) {
-		if args.PrevLogIdx >= len(rf.log) {
-			reply.ConflictIdx = len(rf.log)
-			reply.ConflictTerm = -1
-		} else {
-			reply.ConflictTerm = rf.log[args.PrevLogIdx].Term
-
-			idx := args.PrevLogIdx - 1
-			for ; idx >= 0; idx-- {
-				if rf.log[idx].Term != reply.ConflictTerm {
-					break
-				}
-			}
-			reply.ConflictIdx = idx + 1
-		}
-		DPrintf("[T%d S%d] <- L%d: Rejecting AppendEntries due to log inconsistency. PrevLogIdx: %d, PrevLogTerm: %d. My log len: %d", rf.curTerm, rf.me, args.LeaderId, args.PrevLogIdx, args.PrevLogTerm, len(rf.log))
+	if args.PrevLogIdx >= 0 && (args.PrevLogIdx >= len(rf.log) || rf.log[args.PrevLogIdx].Term != args.PrevLogTerm) {
+		rf.fillConflictReply(args, reply)
+		DPrintf("[T%d S%d] <- L%d: Rejecting AppendEntries due to log inconsistency.", rf.curTerm, rf.me, args.LeaderId)
 		return
 	}
 
@@ -697,6 +683,21 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 		}
 	} else {
 		rf.nextIdx[peerIdx] = reply.ConflictIdx
+	}
+}
+
+func (rf *Raft) fillConflictReply(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
+	if args.PrevLogIdx >= len(rf.log) {
+		reply.ConflictIdx = len(rf.log)
+		reply.ConflictTerm = -1
+	} else {
+		reply.ConflictTerm = rf.log[args.PrevLogIdx].Term
+
+		firstIndexOfTerm := args.PrevLogIdx
+		for firstIndexOfTerm > 0 && rf.log[firstIndexOfTerm-1].Term == reply.ConflictTerm {
+			firstIndexOfTerm--
+		}
+		reply.ConflictIdx = firstIndexOfTerm
 	}
 }
 
