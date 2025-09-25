@@ -177,21 +177,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if args.Term > rf.curTerm {
-		rf.curTerm = args.Term
-		rf.state = follower
-		rf.votedFor = votedForNone
+		rf.becomeFollower(args.Term)
 	}
 
-	var lastLogTerm int64 = -1
-	var lastLogIdx int = -1
-	if len(rf.log) > 0 {
-		lastLogIdx = len(rf.log) - 1
-		lastLogTerm = rf.log[lastLogIdx].Term
-	}
-
-	logIsUpToDate := args.LastLogTerm > lastLogTerm ||
-		(args.LastLogTerm == lastLogTerm && args.LastLogIdx >= lastLogIdx)
-	if args.Term == rf.curTerm && logIsUpToDate && (rf.votedFor == votedForNone || rf.votedFor == args.CandidateId) {
+	if rf.isLogUpToDate(args.LastLogTerm, args.LastLogIdx) &&
+		args.Term == rf.curTerm &&
+		(rf.votedFor == votedForNone || rf.votedFor == args.CandidateId) {
 		reply.VoteGranted = true
 		reply.VoterId = rf.me
 		rf.votedFor = args.CandidateId
@@ -231,9 +222,7 @@ func (rf *Raft) AppendEntriesRPC(args *RequestAppendEntriesArgs, reply *RequestA
 	}
 
 	if args.Term > rf.curTerm {
-		rf.curTerm = args.Term
-		rf.state = follower
-		rf.votedFor = votedForNone
+		rf.becomeFollower(args.Term)
 	}
 
 	reply.Term = rf.curTerm
@@ -464,11 +453,7 @@ func (rf *Raft) countVotes(electionTerm int64, repliesChan chan *RequestVoteRepl
 		case reply := <-repliesChan:
 			rf.mu.Lock()
 			if reply.Term > rf.curTerm {
-				// step down and become follower
-				rf.curTerm = reply.Term
-				rf.state = follower
-				rf.votedFor = votedForNone
-				rf.lastLeaderCallAt = time.Now()
+				rf.becomeFollower(reply.Term)
 				rf.mu.Unlock()
 				return
 			}
@@ -485,10 +470,12 @@ func (rf *Raft) countVotes(electionTerm int64, repliesChan chan *RequestVoteRepl
 					rf.lastLeaderCallAt = time.Now()
 					rf.nextIdx = make([]int, len(rf.peers))
 					rf.matchIdx = make([]int, len(rf.peers))
+
+					logLen := len(rf.log)
 					for i := range rf.peers {
-						rf.nextIdx[i] = len(rf.log)
+						rf.nextIdx[i] = logLen
 						if i == rf.me {
-							rf.matchIdx[i] = len(rf.log) - 1
+							rf.matchIdx[i] = logLen - 1
 						} else {
 							rf.matchIdx[i] = -1
 						}
@@ -556,47 +543,7 @@ func (rf *Raft) replicateLog() {
 
 			DPrintf("[T%d S%d] <- S%d: Got AppendEntries reply. Success: %v, Term: %d", curTerm, rf.me, idx, reply.Success, reply.Term)
 
-			if reply.Term > rf.curTerm {
-				rf.curTerm = reply.Term
-				rf.state = follower
-				rf.votedFor = votedForNone
-				rf.lastLeaderCallAt = time.Now()
-				return
-			}
-
-			if curTerm != rf.curTerm || rf.state != leader {
-				return
-			}
-
-			if reply.Success {
-				rf.nextIdx[idx] = nextIdx + len(entries)
-				rf.matchIdx[idx] = rf.nextIdx[idx] - 1
-
-				lastCommitIdx := rf.commitIdx
-				rf.tryToCommit()
-				if rf.commitIdx != lastCommitIdx {
-					rf.commitCond.Broadcast()
-				}
-				return
-			}
-
-			if reply.ConflictTerm >= 0 {
-				lastIdxTerm := -1
-				for i := len(rf.log) - 1; i >= 0; i-- {
-					if rf.log[i].Term == reply.ConflictTerm {
-						lastIdxTerm = i
-						break
-					}
-				}
-
-				if lastIdxTerm >= 0 {
-					rf.nextIdx[idx] = lastIdxTerm + 1
-				} else {
-					rf.nextIdx[idx] = reply.ConflictIdx
-				}
-			} else {
-				rf.nextIdx[idx] = reply.ConflictIdx
-			}
+			rf.handleAppendEntriesReply(idx, args, reply)
 		}(i)
 	}
 }
@@ -706,6 +653,63 @@ func randElectionIntervalMs() time.Duration {
 }
 func heartbeatIntervalMs() time.Duration {
 	return 40 * time.Millisecond
+}
+
+func (rf *Raft) becomeFollower(term int64) {
+	rf.state = follower
+	rf.curTerm = term
+	rf.votedFor = votedForNone
+	rf.lastLeaderCallAt = time.Now()
+}
+
+func (rf *Raft) isLogUpToDate(candidateTerm int64, candidateIdx int) bool {
+	lastLogIdx, lastLogTerm := -1, int64(-1)
+	if len(rf.log) > 0 {
+		lastLogIdx = len(rf.log) - 1
+		lastLogTerm = rf.log[lastLogIdx].Term
+	}
+	return candidateTerm > lastLogTerm || (candidateTerm == lastLogTerm && candidateIdx >= lastLogIdx)
+}
+
+func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
+	if reply.Term > rf.curTerm {
+		rf.becomeFollower(reply.Term)
+		return
+	}
+
+	if rf.state != leader || args.Term != rf.curTerm {
+		return
+	}
+
+	if reply.Success {
+		rf.matchIdx[peerIdx] = args.PrevLogIdx + len(args.Entries)
+		rf.nextIdx[peerIdx] = rf.matchIdx[peerIdx] + 1
+
+		lastCommitIdx := rf.commitIdx
+		rf.tryToCommit()
+		if rf.commitIdx != lastCommitIdx {
+			rf.commitCond.Broadcast()
+		}
+		return
+	}
+
+	if reply.ConflictTerm >= 0 {
+		lastIdxTerm := -1
+		for i := len(rf.log) - 1; i >= 0; i-- {
+			if rf.log[i].Term == reply.ConflictTerm {
+				lastIdxTerm = i
+				break
+			}
+		}
+
+		if lastIdxTerm >= 0 {
+			rf.nextIdx[peerIdx] = lastIdxTerm + 1
+		} else {
+			rf.nextIdx[peerIdx] = reply.ConflictIdx
+		}
+	} else {
+		rf.nextIdx[peerIdx] = reply.ConflictIdx
+	}
 }
 
 // the service or tester wants to create a Raft server. the ports
