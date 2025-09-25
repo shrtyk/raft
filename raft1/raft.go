@@ -67,8 +67,10 @@ type Raft struct {
 	// for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 	matchIdx []int
 
-	applyChan  chan raftapi.ApplyMsg
-	commitCond sync.Cond
+	applyChan chan raftapi.ApplyMsg
+
+	commitCond     *sync.Cond
+	replicatorCond *sync.Cond
 }
 
 type LogEntry struct {
@@ -366,10 +368,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	})
 	index = len(rf.log)
 	rf.matchIdx[rf.me] = index - 1
+	rf.replicatorCond.Broadcast()
 	DPrintf("[T%d S%d] Start(): Appended log at index %d. Command: %v", rf.curTerm, rf.me, index-1, command)
 	rf.mu.Unlock()
-
-	rf.replicateLog()
 
 	return index, term, isLeader
 }
@@ -480,71 +481,20 @@ func (rf *Raft) countVotes(electionTerm int64, repliesChan chan *RequestVoteRepl
 							rf.matchIdx[i] = -1
 						}
 					}
+
+					for i := range rf.peers {
+						if i == rf.me {
+							continue
+						}
+						go rf.replicator(i, rf.curTerm)
+					}
+
 					rf.mu.Unlock()
-					go rf.replicateLog()
 					return
 				}
 			}
 			rf.mu.Unlock()
 		}
-	}
-}
-
-func (rf *Raft) replicateLog() {
-	rf.mu.Lock()
-	if rf.state != leader {
-		rf.mu.Unlock()
-		return
-	}
-	curTerm := rf.curTerm
-	rf.lastLeaderCallAt = time.Now()
-	rf.mu.Unlock()
-
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-
-		go func(idx int) {
-			rf.mu.Lock()
-			if rf.state != leader {
-				rf.mu.Unlock()
-				return
-			}
-
-			nextIdx := rf.nextIdx[idx]
-			prevLogIdx := nextIdx - 1
-			var prevLogTerm int64 = -1
-			if prevLogIdx >= 0 && prevLogIdx < len(rf.log) {
-				prevLogTerm = rf.log[prevLogIdx].Term
-			}
-
-			entries := make([]LogEntry, len(rf.log[nextIdx:]))
-			copy(entries, rf.log[nextIdx:])
-			args := &RequestAppendEntriesArgs{
-				Term:            curTerm,
-				LeaderId:        rf.me,
-				PrevLogTerm:     prevLogTerm,
-				PrevLogIdx:      prevLogIdx,
-				LeaderCommitIdx: rf.commitIdx,
-				Entries:         entries,
-			}
-			rf.mu.Unlock()
-
-			DPrintf("[T%d S%d] -> S%d: Sending AppendEntries. PrevLogIdx: %d, PrevLogTerm: %d, EntriesLen: %d, LeaderCommit: %d", curTerm, rf.me, idx, args.PrevLogIdx, args.PrevLogTerm, len(args.Entries), args.LeaderCommitIdx)
-
-			reply := &RequestAppendEntriesReply{}
-			if !rf.sendAppendEntriesRPC(idx, args, reply) {
-				DPrintf("[T%d S%d] -> S%d: AppendEntries RPC failed", curTerm, rf.me, idx)
-				return
-			}
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-
-			DPrintf("[T%d S%d] <- S%d: Got AppendEntries reply. Success: %v, Term: %d", curTerm, rf.me, idx, reply.Success, reply.Term)
-
-			rf.handleAppendEntriesReply(idx, args, reply)
-		}(i)
 	}
 }
 
@@ -589,7 +539,9 @@ func (rf *Raft) ticker() {
 			timeout := randElectionIntervalMs()
 			time.Sleep(timeout)
 		case leader:
-			rf.replicateLog()
+			rf.mu.Lock()
+			rf.replicatorCond.Broadcast()
+			rf.mu.Unlock()
 
 			timeout := heartbeatIntervalMs()
 			time.Sleep(timeout)
@@ -644,6 +596,42 @@ func (rf *Raft) applier() {
 			rf.lastAppliedIdx = commitIdx
 		}
 		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) replicator(peerIdx int, term int64) {
+	for !rf.killed() {
+		rf.mu.Lock()
+		rf.replicatorCond.Wait()
+
+		if rf.curTerm != term || rf.state != leader {
+			rf.mu.Unlock()
+			return
+		}
+
+		prevLogIdx := rf.nextIdx[peerIdx] - 1
+		var prevLogTerm int64 = -1
+		if prevLogIdx >= 0 {
+			prevLogTerm = rf.log[prevLogIdx].Term
+		}
+		entries := rf.log[rf.nextIdx[peerIdx]:]
+		args := &RequestAppendEntriesArgs{
+			Term:            term,
+			LeaderId:        rf.me,
+			PrevLogTerm:     prevLogTerm,
+			PrevLogIdx:      prevLogIdx,
+			LeaderCommitIdx: rf.commitIdx,
+			Entries:         make([]LogEntry, len(entries)),
+		}
+		copy(args.Entries, entries)
+		rf.mu.Unlock()
+
+		reply := &RequestAppendEntriesReply{}
+		if rf.sendAppendEntriesRPC(peerIdx, args, reply) {
+			rf.mu.Lock()
+			rf.handleAppendEntriesReply(peerIdx, args, reply)
+			rf.mu.Unlock()
+		}
 	}
 }
 
@@ -730,7 +718,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.mu = sync.Mutex{}
-	rf.commitCond = *sync.NewCond(&rf.mu)
+	rf.commitCond = sync.NewCond(&rf.mu)
+	rf.replicatorCond = sync.NewCond(&rf.mu)
+
 	rf.state = follower
 	rf.votedFor = votedForNone
 	rf.lastLeaderCallAt = time.Now()
