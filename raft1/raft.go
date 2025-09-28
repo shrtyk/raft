@@ -274,13 +274,6 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 	if args.LeaderCommitIdx > rf.commitIdx {
 		lastLogIndex := len(rf.log) - 1
 		rf.commitIdx = min(args.LeaderCommitIdx, lastLogIndex)
-		if rf.commitIdx >= len(rf.log) {
-			if len(rf.log) == 0 {
-				rf.commitIdx = -1
-			} else {
-				rf.commitIdx = len(rf.log) - 1
-			}
-		}
 		rf.commitCond.Broadcast()
 	}
 
@@ -572,15 +565,6 @@ func (rf *Raft) applier() {
 		rf.mu.Lock()
 		for rf.commitIdx <= rf.lastAppliedIdx && !rf.killed() {
 			rf.commitCond.Wait()
-		}
-
-		if rf.commitIdx >= len(rf.log) {
-			if len(rf.log) == 0 && rf.commitIdx != 1 {
-				rf.commitIdx = -1
-				rf.mu.Unlock()
-				continue
-			}
-			rf.commitIdx = len(rf.log) - 1
 		}
 
 		lastApplied := rf.lastAppliedIdx
