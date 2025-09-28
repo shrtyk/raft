@@ -76,10 +76,9 @@ type LogEntry struct {
 func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
-	// Your code here (3A).
 
 	rf.mu.Lock()
-	term = int(rf.curTerm) // potential bug if applicaion will be booted on 32bit systems
+	term = rf.curTerm
 	isleader = rf.state == leader
 	rf.mu.Unlock()
 
@@ -137,14 +136,12 @@ type RequestVoteArgs struct {
 }
 
 type RequestVoteReply struct {
-	// Your data here (3A).
 	Term        int
 	VoteGranted bool
 	VoterId     int
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -170,17 +167,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastLogIdx = len(rf.log) - 1
 		lastLogTerm = rf.log[lastLogIdx].Term
 	}
-	logIsUpToDate := args.LastLogTerm > lastLogTerm ||
+	logOk := args.LastLogTerm > lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIdx >= lastLogIdx)
-	if (rf.votedFor == votedForNone || rf.votedFor == args.CandidateId) && logIsUpToDate {
+	termsOk := args.Term == rf.curTerm
+	if termsOk && logOk && (rf.votedFor == votedForNone || rf.votedFor == args.CandidateId) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.lastLeaderCallAt = time.Now()
 	}
 }
 
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVoteRPC(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntriesRPC(
+	server int,
+	args *RequestAppendEntriesArgs,
+	reply *RequestAppendEntriesReply,
+) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -196,7 +203,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
 }
 
 func (rf *Raft) killed() bool {
@@ -216,15 +222,6 @@ type RequestAppendEntriesArgs struct {
 type RequestAppendEntriesReply struct {
 	Term    int
 	Success bool
-}
-
-func (rf *Raft) sendAppendEntries(
-	server int,
-	args *RequestAppendEntriesArgs,
-	reply *RequestAppendEntriesReply,
-) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
 }
 
 func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
@@ -250,7 +247,9 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 	reply.Term = rf.curTerm
 }
 
-func (rf *Raft) startElection(timeout time.Duration) {
+func (rf *Raft) startElection() {
+	timeout := randElectionIntervalMs()
+
 	var lastLogIdx int
 	var lastLogTerm int
 
@@ -278,12 +277,13 @@ func (rf *Raft) startElection(timeout time.Duration) {
 		}
 		go func(idx int) {
 			reply := &RequestVoteReply{}
-			if rf.sendRequestVote(idx, args, reply) {
+			if rf.sendRequestVoteRPC(idx, args, reply) {
 				repliesChan <- reply
 			}
 		}(i)
 	}
-	go rf.countVotes(timeout, repliesChan)
+
+	rf.countVotes(timeout, repliesChan)
 }
 
 func (rf *Raft) countVotes(timeout time.Duration, repliesChan <-chan *RequestVoteReply) {
@@ -307,7 +307,7 @@ func (rf *Raft) countVotes(timeout time.Duration, repliesChan <-chan *RequestVot
 				if rf.isEnoughVotes(votes) {
 					rf.state = leader
 					rf.mu.Unlock()
-					go rf.startHeartbeat(timeout)
+					rf.sendAppendEntries()
 					return
 				}
 			}
@@ -323,37 +323,49 @@ func (rf *Raft) isEnoughVotes(votes []bool) bool {
 			vc++
 		}
 	}
-	return vc > len(rf.log)/2
+	return vc > len(rf.peers)/2
 }
 
-func (rf *Raft) startHeartbeat(timeout time.Duration) {
+func (rf *Raft) sendAppendEntries() {
+	timeout := heartbeatIntervalMs()
+
 	rf.mu.Lock()
 	curTerm := rf.curTerm
-	rf.lastLeaderCallAt = time.Now()
 	rf.mu.Unlock()
 
 	repliesChan := make(chan *RequestAppendEntriesReply, len(rf.peers)-1)
+	rf.callAppendEntries(repliesChan, curTerm)
+	rf.readAppendEntriesReplies(timeout, repliesChan)
+}
+
+func (rf *Raft) callAppendEntries(repliesChan chan<- *RequestAppendEntriesReply, term int) {
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 
-		go func(idx int) {
+		go func(peerIdx int) {
+			rf.mu.Lock()
+			if rf.curTerm != term || rf.state != leader {
+				rf.mu.Unlock()
+				return
+			}
+
 			args := &RequestAppendEntriesArgs{
-				Term:     curTerm,
+				Term:     term,
 				LeaderId: rf.me,
 				Entries:  make([]LogEntry, 0),
 			}
+			rf.mu.Unlock()
 			reply := &RequestAppendEntriesReply{}
-			if rf.sendAppendEntries(idx, args, reply) {
+			if rf.sendAppendEntriesRPC(peerIdx, args, reply) {
 				repliesChan <- reply
 			}
 		}(i)
 	}
-	go rf.readHeartbeatReplies(timeout, repliesChan)
 }
 
-func (rf *Raft) readHeartbeatReplies(timeout time.Duration, repliesChan <-chan *RequestAppendEntriesReply) {
+func (rf *Raft) readAppendEntriesReplies(timeout time.Duration, repliesChan <-chan *RequestAppendEntriesReply) {
 	for {
 		select {
 		case <-time.After(timeout):
@@ -369,8 +381,6 @@ func (rf *Raft) readHeartbeatReplies(timeout time.Duration, repliesChan <-chan *
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
-		// Your code here (3A)
-		// Check if a leader election should be started.
 		rf.mu.Lock()
 		state := rf.state
 		rf.mu.Unlock()
@@ -386,15 +396,9 @@ func (rf *Raft) ticker() {
 			}
 			rf.mu.Unlock()
 		case candidate:
-			timeout := randElectionIntervalMs()
-			go rf.startElection(timeout)
-
-			time.Sleep(timeout)
+			rf.startElection()
 		case leader:
-			timeout := heartbeatIntervalMs()
-			go rf.startHeartbeat(timeout)
-
-			time.Sleep(timeout)
+			rf.sendAppendEntries()
 		}
 	}
 }
@@ -414,17 +418,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (3A, 3B, 3C).
 	rf.state = follower
 	rf.lastLeaderCallAt = time.Now()
 	rf.log = make([]LogEntry, 0)
 	rf.nextIdx = make([]int, len(peers))
 	rf.matchIdx = make([]int, len(peers))
 
-	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// start ticker goroutine to start elections
 	go rf.ticker()
 
 	return rf
