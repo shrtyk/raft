@@ -50,9 +50,9 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	state            State
-	lastLeaderCallAt time.Time // last time got leader call
-	lastHeartbeatAt  time.Time // last time leader sent heartbeat
+	state               State
+	lastLeaderCallAt    time.Time // last time got leader call
+	lastAppendEntriesAt time.Time // last time leader sent Append Entries
 
 	applyChan  chan raftapi.ApplyMsg
 	commitCond *sync.Cond
@@ -160,12 +160,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if args.Term > rf.curTerm {
-		rf.curTerm = args.Term
-		rf.state = follower
-		rf.votedFor = votedForNone
-	}
-
+	rf.becomeFollower(args.Term)
 	reply.Term = rf.curTerm
 
 	lastLogIdx, lastLogTerm := rf.lastLogIdxAndTerm()
@@ -258,12 +253,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 		return
 	}
 
-	rf.state = follower
-	if args.Term > rf.curTerm {
-		rf.curTerm = args.Term
-		rf.votedFor = votedForNone
-	}
-
+	rf.becomeFollower(args.Term)
 	reply.Term = rf.curTerm
 	if args.PrevLogIdx >= 0 && (args.PrevLogIdx >= len(rf.log) || rf.log[args.PrevLogIdx].Term != args.PrevLogTerm) {
 		rf.fillConflictReply(args, reply)
@@ -321,11 +311,8 @@ func (rf *Raft) startElection() {
 	timeout := randElectionIntervalMs()
 
 	rf.mu.Lock()
-	rf.curTerm++
-	rf.votedFor = rf.me
 	lastLogIdx, lastLogTerm := rf.lastLogIdxAndTerm()
 	currentTerm := rf.curTerm
-	rf.lastLeaderCallAt = time.Now()
 	rf.mu.Unlock()
 
 	repliesChan := make(chan *RequestVoteReply, len(rf.peers)-1)
@@ -361,23 +348,13 @@ func (rf *Raft) countVotes(timeout time.Duration, repliesChan <-chan *RequestVot
 		case reply := <-repliesChan:
 			rf.mu.Lock()
 			if reply.Term > rf.curTerm {
-				rf.curTerm = reply.Term
-				rf.state = follower
-				rf.votedFor = votedForNone
+				rf.becomeFollower(reply.Term)
 				rf.mu.Unlock()
 				return
 			} else if reply.VoteGranted && rf.state == candidate {
 				votes[reply.VoterId] = true
 				if rf.isEnoughVotes(votes) {
-					rf.state = leader
-
-					lastLogIdx, _ := rf.lastLogIdxAndTerm()
-					for i := range rf.peers {
-						rf.nextIdx[i] = lastLogIdx + 1
-						rf.matchIdx[i] = -1
-					}
-					rf.matchIdx[rf.me] = lastLogIdx
-
+					rf.becomeLeader()
 					rf.mu.Unlock()
 					rf.sendAppendEntries()
 					return
@@ -400,6 +377,7 @@ func (rf *Raft) isEnoughVotes(votes []bool) bool {
 
 func (rf *Raft) sendAppendEntries() {
 	rf.mu.Lock()
+	rf.lastAppendEntriesAt = time.Now()
 	curTerm := rf.curTerm
 	rf.mu.Unlock()
 
@@ -468,9 +446,7 @@ func (rf *Raft) callAppendEntries(term int) {
 
 func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	if reply.Term > rf.curTerm {
-		rf.state = follower
-		rf.curTerm = reply.Term
-		rf.votedFor = votedForNone
+		rf.becomeFollower(reply.Term)
 		rf.lastLeaderCallAt = time.Now()
 		return
 	}
@@ -542,7 +518,7 @@ func (rf *Raft) ticker() {
 
 			rf.mu.Lock()
 			if time.Since(rf.lastLeaderCallAt) >= timeout {
-				rf.state = candidate
+				rf.becomeCandidate()
 			}
 			rf.mu.Unlock()
 		case candidate:
@@ -551,7 +527,7 @@ func (rf *Raft) ticker() {
 			timeout := heartbeatIntervalMs()
 			time.Sleep(timeout)
 			rf.mu.Lock()
-			if time.Since(rf.lastHeartbeatAt) >= timeout {
+			if time.Since(rf.lastAppendEntriesAt) >= timeout {
 				rf.mu.Unlock()
 				rf.sendAppendEntries()
 			} else {
@@ -617,13 +593,38 @@ func (rf *Raft) lastLogIdxAndTerm() (lastLogIdx int, lastLogTerm int) {
 	return
 }
 
+func (rf *Raft) becomeFollower(term int) {
+	rf.state = follower
+	if term > rf.curTerm {
+		rf.curTerm = term
+		rf.votedFor = votedForNone
+	}
+}
+
+func (rf *Raft) becomeCandidate() {
+	rf.state = candidate
+	rf.curTerm++
+	rf.votedFor = rf.me
+	rf.lastLeaderCallAt = time.Now()
+}
+
+func (rf *Raft) becomeLeader() {
+	rf.state = leader
+	lastLogIdx, _ := rf.lastLogIdxAndTerm()
+	for i := range rf.peers {
+		rf.nextIdx[i] = lastLogIdx + 1
+		rf.matchIdx[i] = -1
+	}
+	rf.matchIdx[rf.me] = lastLogIdx
+}
+
 func randElectionIntervalMs() time.Duration {
 	ms := 300 + (rand.Int63() % 300)
 	return time.Duration(ms) * time.Millisecond
 }
 
 func heartbeatIntervalMs() time.Duration {
-	return 70 * time.Millisecond
+	return 60 * time.Millisecond
 }
 
 func Make(peers []*labrpc.ClientEnd, me int,
