@@ -274,6 +274,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 	if args.LeaderCommitIdx > rf.commitIdx {
 		lastLogIndex := len(rf.log) - 1
 		rf.commitIdx = min(args.LeaderCommitIdx, lastLogIndex)
+		rf.checkIsLogTruncated()
 		rf.commitCond.Broadcast()
 	}
 
@@ -567,6 +568,8 @@ func (rf *Raft) applier() {
 			rf.commitCond.Wait()
 		}
 
+		rf.checkIsLogTruncated()
+
 		lastApplied := rf.lastAppliedIdx
 		commitIdx := rf.commitIdx
 		if commitIdx <= lastApplied {
@@ -599,6 +602,12 @@ func (rf *Raft) applier() {
 	}
 }
 
+func (rf *Raft) checkIsLogTruncated() {
+	if rf.commitIdx >= len(rf.log) {
+		rf.commitIdx = len(rf.log) - 1
+	}
+}
+
 func (rf *Raft) lastLogIdxAndTerm() (lastLogIdx int, lastLogTerm int) {
 	lastLogIdx, lastLogTerm = -1, -1
 	if len(rf.log) > 0 {
@@ -614,7 +623,7 @@ func randElectionIntervalMs() time.Duration {
 }
 
 func heartbeatIntervalMs() time.Duration {
-	return 50 * time.Millisecond
+	return 70 * time.Millisecond
 }
 
 func Make(peers []*labrpc.ClientEnd, me int,
