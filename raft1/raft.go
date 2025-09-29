@@ -1,21 +1,11 @@
 package raft
 
-// The file raftapi/raft.go defines the interface that raft must
-// expose to servers (or the tester), but see comments below for each
-// of these functions for more details.
-//
-// Make() creates a new raft peer that implements the raft interface.
-
 import (
-	//	"bytes"
-
 	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	//	"github.com/shrtyk/raft/labgob"
 
 	"github.com/shrtyk/raft/labgob"
 	"github.com/shrtyk/raft/labrpc"
