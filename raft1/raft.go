@@ -9,6 +9,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 
 	//	"github.com/shrtyk/raft/labgob"
 
+	"github.com/shrtyk/raft/labgob"
 	"github.com/shrtyk/raft/labrpc"
 	"github.com/shrtyk/raft/raftapi"
 	tester "github.com/shrtyk/raft/tester1"
@@ -35,7 +37,9 @@ const (
 )
 
 const (
-	RPCTimeout = 500 * time.Millisecond
+	ElectionTimeoutRand = 300 * time.Millisecond
+	ElectionTimeoutBase = 300 * time.Millisecond
+	HeartbeatInterval   = 70 * time.Millisecond
 )
 
 // A Go object implementing a single Raft peer.
@@ -94,14 +98,15 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(rf.curTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	data := w.Bytes()
+	rf.persister.Save(data, nil)
 }
 
 // restore previously persisted state.
@@ -109,19 +114,35 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	b := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(b)
+
+	term, votedFor, log, err := decodeData(d)
+	if err != nil {
+		DPrintf("Failed to decode important data: %s", err)
+		return
+	}
+
+	rf.curTerm = term
+	rf.votedFor = votedFor
+	rf.log = log
+}
+
+func decodeData(decoder *labgob.LabDecoder) (term int, votedFor int, log []LogEntry, err error) {
+	if e := decoder.Decode(&term); e != nil {
+		err = e
+		return
+	}
+	if e := decoder.Decode(&votedFor); e != nil {
+		err = e
+		return
+	}
+	if e := decoder.Decode(&log); e != nil {
+		err = e
+		return
+	}
+	return
 }
 
 func (rf *Raft) PersistBytes() int {
@@ -170,7 +191,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if termsOk && logOk && (rf.votedFor == votedForNone || rf.votedFor == args.CandidateId) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
-		rf.lastLeaderCallAt = time.Now()
+		rf.persist()
+		rf.resetElectionTimer()
 	}
 }
 
@@ -196,8 +218,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 
 	isLeader = rf.state == leader
-	term = int(rf.curTerm)
-
+	term = rf.curTerm
 	if !isLeader {
 		rf.mu.Unlock()
 		// redirect to leader node
@@ -208,6 +229,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term: rf.curTerm,
 		Cmd:  command,
 	})
+	rf.persist()
 	index = len(rf.log)
 	rf.matchIdx[rf.me] = index - 1
 	rf.mu.Unlock()
@@ -268,7 +290,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 		rf.commitCond.Broadcast()
 	}
 
-	rf.lastLeaderCallAt = time.Now()
+	rf.resetElectionTimer()
 	reply.Success = true
 }
 
@@ -289,6 +311,7 @@ func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) {
 
 	if newEntriesIdx < len(args.Entries) || len(rf.log) > logInsertIdx {
 		rf.log = append(rf.log[:logInsertIdx], args.Entries[newEntriesIdx:]...)
+		rf.persist()
 	}
 }
 
@@ -377,7 +400,7 @@ func (rf *Raft) isEnoughVotes(votes []bool) bool {
 
 func (rf *Raft) sendAppendEntries() {
 	rf.mu.Lock()
-	rf.lastAppendEntriesAt = time.Now()
+	rf.resetHeartbeatTimer()
 	curTerm := rf.curTerm
 	rf.mu.Unlock()
 
@@ -447,7 +470,7 @@ func (rf *Raft) callAppendEntries(term int) {
 func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	if reply.Term > rf.curTerm {
 		rf.becomeFollower(reply.Term)
-		rf.lastLeaderCallAt = time.Now()
+		rf.resetElectionTimer()
 		return
 	}
 
@@ -524,10 +547,9 @@ func (rf *Raft) ticker() {
 		case candidate:
 			rf.startElection()
 		case leader:
-			timeout := heartbeatIntervalMs()
-			time.Sleep(timeout)
+			time.Sleep(HeartbeatInterval)
 			rf.mu.Lock()
-			if time.Since(rf.lastAppendEntriesAt) >= timeout {
+			if time.Since(rf.lastAppendEntriesAt) >= HeartbeatInterval {
 				rf.mu.Unlock()
 				rf.sendAppendEntries()
 			} else {
@@ -598,6 +620,7 @@ func (rf *Raft) becomeFollower(term int) {
 	if term > rf.curTerm {
 		rf.curTerm = term
 		rf.votedFor = votedForNone
+		rf.persist()
 	}
 }
 
@@ -605,11 +628,13 @@ func (rf *Raft) becomeCandidate() {
 	rf.state = candidate
 	rf.curTerm++
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.lastLeaderCallAt = time.Now()
 }
 
 func (rf *Raft) becomeLeader() {
 	rf.state = leader
+	rf.persist()
 	lastLogIdx, _ := rf.lastLogIdxAndTerm()
 	for i := range rf.peers {
 		rf.nextIdx[i] = lastLogIdx + 1
@@ -618,13 +643,16 @@ func (rf *Raft) becomeLeader() {
 	rf.matchIdx[rf.me] = lastLogIdx
 }
 
-func randElectionIntervalMs() time.Duration {
-	ms := 300 + (rand.Int63() % 300)
-	return time.Duration(ms) * time.Millisecond
+func (rf *Raft) resetElectionTimer() {
+	rf.lastLeaderCallAt = time.Now()
 }
 
-func heartbeatIntervalMs() time.Duration {
-	return 60 * time.Millisecond
+func (rf *Raft) resetHeartbeatTimer() {
+	rf.lastAppendEntriesAt = time.Now()
+}
+
+func randElectionIntervalMs() time.Duration {
+	return ElectionTimeoutBase + time.Duration(rand.Int63n(int64(ElectionTimeoutRand)))
 }
 
 func Make(peers []*labrpc.ClientEnd, me int,
