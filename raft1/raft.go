@@ -144,7 +144,7 @@ func (rf *Raft) PersistBytes() int {
 }
 
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
+	// TODO
 
 }
 
