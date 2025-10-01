@@ -175,9 +175,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	rf.becomeFollower(args.Term)
-	reply.Term = rf.curTerm
+	if args.Term > rf.curTerm {
+		rf.becomeFollower(args.Term)
+	}
 
+	reply.Term = rf.curTerm
 	lastLogIdx, lastLogTerm := rf.lastLogIdxAndTerm()
 	logOk := args.LastLogTerm > lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIdx >= lastLogIdx)
@@ -341,6 +343,10 @@ func (rf *Raft) startElection() {
 	timeout := randElectionIntervalMs()
 
 	rf.mu.Lock()
+	rf.curTerm++
+	rf.votedFor = rf.me
+	rf.persist()
+	rf.resetElectionTimer()
 	DPrintf("S%d T%d C: starting election", rf.me, rf.curTerm)
 	lastLogIdx, lastLogTerm := rf.lastLogIdxAndTerm()
 	currentTerm := rf.curTerm
@@ -558,7 +564,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Lock()
 			if time.Since(rf.lastLeaderCallAt) >= timeout {
 				DPrintf("S%d T%d F: election timeout", rf.me, rf.curTerm)
-				rf.becomeCandidate()
+				rf.state = candidate
 			}
 			rf.mu.Unlock()
 		case candidate:
@@ -627,14 +633,6 @@ func (rf *Raft) becomeFollower(term int) {
 		rf.curTerm = term
 		rf.votedFor = votedForNone
 	}
-}
-
-func (rf *Raft) becomeCandidate() {
-	rf.state = candidate
-	rf.curTerm++
-	rf.votedFor = rf.me
-	rf.persist()
-	rf.lastLeaderCallAt = time.Now()
 }
 
 func (rf *Raft) becomeLeader() {
