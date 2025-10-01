@@ -183,15 +183,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	lastLogIdx, lastLogTerm := rf.lastLogIdxAndTerm()
 	logOk := args.LastLogTerm > lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIdx >= lastLogIdx)
-	termsOk := args.Term == rf.curTerm
-	if termsOk && logOk && (rf.votedFor == votedForNone || rf.votedFor == args.CandidateId) {
+	if logOk && (rf.votedFor == votedForNone || rf.votedFor == args.CandidateId) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.persist()
 		rf.resetElectionTimer()
 		DPrintf("S%d T%d: granted vote for S%d T%d", rf.me, rf.curTerm, args.CandidateId, args.Term)
 	} else {
-		DPrintf("S%d T%d: rejected vote for S%d T%d (logOk=%v, termsOk=%v, votedFor=%d)", rf.me, rf.curTerm, args.CandidateId, args.Term, logOk, termsOk, rf.votedFor)
+		DPrintf("S%d T%d: rejected vote for S%d T%d (logOk=%v, votedFor=%d)", rf.me, rf.curTerm, args.CandidateId, args.Term, logOk, rf.votedFor)
 	}
 }
 
@@ -277,11 +276,8 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 		return
 	}
 
-	termChanged := args.Term > rf.curTerm
+	rf.resetElectionTimer()
 	rf.becomeFollower(args.Term)
-	if termChanged {
-		rf.persist()
-	}
 	reply.Term = rf.curTerm
 	if args.PrevLogIdx >= 0 && (args.PrevLogIdx >= len(rf.log) || rf.log[args.PrevLogIdx].Term != args.PrevLogTerm) {
 		rf.fillConflictReply(args, reply)
@@ -294,11 +290,9 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 		lastLogIndex := len(rf.log) - 1
 		rf.commitIdx = min(args.LeaderCommitIdx, lastLogIndex)
 		DPrintf("S%d T%d: updated commitIdx to %d", rf.me, rf.curTerm, rf.commitIdx)
-		rf.checkIsLogTruncated()
 		rf.commitCond.Broadcast()
 	}
 
-	rf.resetElectionTimer()
 	reply.Success = true
 	DPrintf("S%d T%d: accepted AppendEntries from S%d T%d", rf.me, rf.curTerm, args.LeaderId, args.Term)
 }
@@ -386,6 +380,7 @@ func (rf *Raft) countVotes(timeout time.Duration, repliesChan <-chan *RequestVot
 			rf.mu.Lock()
 			if reply.Term > rf.curTerm {
 				rf.becomeFollower(reply.Term)
+				rf.resetElectionTimer()
 				rf.mu.Unlock()
 				return
 			} else if reply.VoteGranted && rf.state == candidate {
@@ -605,16 +600,8 @@ func (rf *Raft) applier() {
 		}
 
 		rf.mu.Lock()
-		if rf.lastAppliedIdx == idxToApply-1 {
-			rf.lastAppliedIdx = idxToApply
-		}
+		rf.lastAppliedIdx = idxToApply
 		rf.mu.Unlock()
-	}
-}
-
-func (rf *Raft) checkIsLogTruncated() {
-	if rf.commitIdx >= len(rf.log) {
-		rf.commitIdx = len(rf.log) - 1
 	}
 }
 
@@ -632,6 +619,7 @@ func (rf *Raft) becomeFollower(term int) {
 	if term > rf.curTerm {
 		rf.curTerm = term
 		rf.votedFor = votedForNone
+		rf.persist()
 	}
 }
 
