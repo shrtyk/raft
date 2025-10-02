@@ -593,8 +593,6 @@ func (rf *Raft) applier() {
 			rf.commitCond.Wait()
 		}
 
-		rf.updateCommitIdxIfLogTruncated()
-
 		lastApplied := rf.lastAppliedIdx
 		commitIdx := rf.commitIdx
 		if commitIdx <= lastApplied {
@@ -604,27 +602,18 @@ func (rf *Raft) applier() {
 
 		msgs := make([]raftapi.ApplyMsg, 0, commitIdx-lastApplied)
 		for i := lastApplied + 1; i <= commitIdx; i++ {
-			if i < 0 || i >= len(rf.log) {
-				break
-			}
 			msgs = append(msgs, raftapi.ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[i].Cmd,
 				CommandIndex: i + 1,
 			})
-			rf.lastAppliedIdx++
 		}
 		rf.mu.Unlock()
 
 		for _, msg := range msgs {
 			rf.applyChan <- msg
 		}
-	}
-}
-
-func (rf *Raft) updateCommitIdxIfLogTruncated() {
-	if rf.commitIdx >= len(rf.log) {
-		rf.commitIdx = len(rf.log) - 1
+		rf.lastAppliedIdx = commitIdx
 	}
 }
 
@@ -690,17 +679,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	rf.readPersist(persister.ReadRaftState())
-
-	if rf.log == nil {
-		rf.log = make([]LogEntry, 0)
-	}
-
-	if rf.commitIdx >= len(rf.log) {
-		rf.commitIdx = len(rf.log) - 1
-	}
-	if rf.lastAppliedIdx >= len(rf.log) {
-		rf.lastAppliedIdx = len(rf.log) - 1
-	}
 
 	go rf.applier()
 	go rf.ticker()
