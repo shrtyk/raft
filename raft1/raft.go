@@ -276,8 +276,11 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 		return
 	}
 
+	if args.Term > rf.curTerm {
+		rf.becomeFollower(args.Term)
+	}
+
 	rf.resetElectionTimer()
-	rf.becomeFollower(args.Term)
 	reply.Term = rf.curTerm
 	if args.PrevLogIdx >= 0 && (args.PrevLogIdx >= len(rf.log) || rf.log[args.PrevLogIdx].Term != args.PrevLogTerm) {
 		rf.fillConflictReply(args, reply)
@@ -312,9 +315,11 @@ func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) {
 		newEntriesIdx++
 	}
 
-	if newEntriesIdx < len(args.Entries) || len(rf.log) > logInsertIdx {
+	if newEntriesIdx < len(args.Entries) {
 		rf.log = append(rf.log[:logInsertIdx], args.Entries[newEntriesIdx:]...)
 		rf.persist()
+		DPrintf("S%d T%d: appended %d entries at index %d. New log length: %d",
+			rf.me, rf.curTerm, len(args.Entries[newEntriesIdx:]), logInsertIdx, len(rf.log))
 	}
 }
 
@@ -530,14 +535,18 @@ func (rf *Raft) tryToCommit() {
 		if rf.log[i].Term != rf.curTerm {
 			continue
 		}
-		count := 0
+
+		count := 1
 		for peer := range rf.peers {
+			if peer == rf.me {
+				continue
+			}
 			if rf.matchIdx[peer] >= i {
 				count++
 			}
 		}
 
-		if count > len(rf.peers)/2 {
+		if count > len(rf.peers)/2 && i > rf.commitIdx {
 			DPrintf("S%d T%d L: committing index %d", rf.me, rf.curTerm, i)
 			rf.commitIdx = i
 		}
@@ -557,9 +566,9 @@ func (rf *Raft) ticker() {
 			time.Sleep(timeout)
 
 			rf.mu.Lock()
-			if time.Since(rf.lastLeaderCallAt) >= timeout {
-				DPrintf("S%d T%d F: election timeout", rf.me, rf.curTerm)
+			if rf.state == follower && time.Since(rf.lastLeaderCallAt) >= timeout {
 				rf.state = candidate
+				DPrintf("S%d T%d F: election timeout", rf.me, rf.curTerm)
 			}
 			rf.mu.Unlock()
 		case candidate:
@@ -580,28 +589,42 @@ func (rf *Raft) ticker() {
 func (rf *Raft) applier() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for rf.commitIdx <= rf.lastAppliedIdx {
+		for rf.commitIdx <= rf.lastAppliedIdx && !rf.killed() {
 			rf.commitCond.Wait()
 		}
 
-		if rf.commitIdx >= len(rf.log) {
+		rf.updateCommitIdxIfLogTruncated()
+
+		lastApplied := rf.lastAppliedIdx
+		commitIdx := rf.commitIdx
+		if commitIdx <= lastApplied {
 			rf.mu.Unlock()
 			continue
 		}
 
-		idxToApply := rf.lastAppliedIdx + 1
-		entryToApply := rf.log[idxToApply]
-		rf.mu.Unlock()
-
-		rf.applyChan <- raftapi.ApplyMsg{
-			CommandValid: true,
-			Command:      entryToApply.Cmd,
-			CommandIndex: idxToApply + 1,
+		msgs := make([]raftapi.ApplyMsg, 0, commitIdx-lastApplied)
+		for i := lastApplied + 1; i <= commitIdx; i++ {
+			if i < 0 || i >= len(rf.log) {
+				break
+			}
+			msgs = append(msgs, raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i].Cmd,
+				CommandIndex: i + 1,
+			})
+			rf.lastAppliedIdx++
 		}
-
-		rf.mu.Lock()
-		rf.lastAppliedIdx = idxToApply
 		rf.mu.Unlock()
+
+		for _, msg := range msgs {
+			rf.applyChan <- msg
+		}
+	}
+}
+
+func (rf *Raft) updateCommitIdxIfLogTruncated() {
+	if rf.commitIdx >= len(rf.log) {
+		rf.commitIdx = len(rf.log) - 1
 	}
 }
 
@@ -667,6 +690,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	rf.readPersist(persister.ReadRaftState())
+
+	if rf.log == nil {
+		rf.log = make([]LogEntry, 0)
+	}
+
+	if rf.commitIdx >= len(rf.log) {
+		rf.commitIdx = len(rf.log) - 1
+	}
+	if rf.lastAppliedIdx >= len(rf.log) {
+		rf.lastAppliedIdx = len(rf.log) - 1
+	}
 
 	go rf.applier()
 	go rf.ticker()
