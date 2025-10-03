@@ -88,7 +88,6 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 func (rf *Raft) persist() {
-	DPrintf("S%d T%d: persisting state. votedFor=%d, logLen=%d", rf.me, rf.curTerm, rf.votedFor, len(rf.log))
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
@@ -105,14 +104,12 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	DPrintf("S%d: reading persisted state", rf.me)
 
 	b := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(b)
 
 	term, votedFor, log, err := decodeData(d)
 	if err != nil {
-		DPrintf("Failed to decode important data: %s", err)
 		return
 	}
 
@@ -164,14 +161,12 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("S%d T%d: received RequestVote from S%d T%d", rf.me, rf.curTerm, args.CandidateId, args.Term)
 
 	reply.VoteGranted = false
 	reply.VoterId = rf.me
 
 	if args.Term < rf.curTerm {
 		reply.Term = rf.curTerm
-		DPrintf("S%d T%d: rejected vote for S%d T%d (stale term)", rf.me, rf.curTerm, args.CandidateId, args.Term)
 		return
 	}
 
@@ -188,9 +183,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		rf.persist()
 		rf.resetElectionTimer()
-		DPrintf("S%d T%d: granted vote for S%d T%d", rf.me, rf.curTerm, args.CandidateId, args.Term)
-	} else {
-		DPrintf("S%d T%d: rejected vote for S%d T%d (logOk=%v, votedFor=%d)", rf.me, rf.curTerm, args.CandidateId, args.Term, logOk, rf.votedFor)
 	}
 }
 
@@ -266,13 +258,11 @@ type RequestAppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("S%d T%d: received AppendEntries from S%d T%d. PrevLogIdx: %d, #Entries: %d, LeaderCommit: %d", rf.me, rf.curTerm, args.LeaderId, args.Term, args.PrevLogIdx, len(args.Entries), args.LeaderCommitIdx)
 
 	reply.Success = false
 	reply.Term = rf.curTerm
 
 	if args.Term < rf.curTerm {
-		DPrintf("S%d T%d: rejected AppendEntries from S%d T%d (stale term)", rf.me, rf.curTerm, args.LeaderId, args.Term)
 		return
 	}
 
@@ -284,7 +274,6 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 	reply.Term = rf.curTerm
 	if args.PrevLogIdx >= 0 && (args.PrevLogIdx >= len(rf.log) || rf.log[args.PrevLogIdx].Term != args.PrevLogTerm) {
 		rf.fillConflictReply(args, reply)
-		DPrintf("S%d T%d: rejected AppendEntries from S%d T%d (log mismatch). ConflictTerm: %d, ConflictIdx: %d", rf.me, rf.curTerm, args.LeaderId, args.Term, reply.ConflictTerm, reply.ConflictIdx)
 		return
 	}
 
@@ -292,12 +281,10 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 	if args.LeaderCommitIdx > rf.commitIdx {
 		lastLogIndex := len(rf.log) - 1
 		rf.commitIdx = min(args.LeaderCommitIdx, lastLogIndex)
-		DPrintf("S%d T%d: updated commitIdx to %d", rf.me, rf.curTerm, rf.commitIdx)
 		rf.commitCond.Broadcast()
 	}
 
 	reply.Success = true
-	DPrintf("S%d T%d: accepted AppendEntries from S%d T%d", rf.me, rf.curTerm, args.LeaderId, args.Term)
 }
 
 func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) {
@@ -318,8 +305,6 @@ func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) {
 	if newEntriesIdx < len(args.Entries) {
 		rf.log = append(rf.log[:logInsertIdx], args.Entries[newEntriesIdx:]...)
 		rf.persist()
-		DPrintf("S%d T%d: appended %d entries at index %d. New log length: %d",
-			rf.me, rf.curTerm, len(args.Entries[newEntriesIdx:]), logInsertIdx, len(rf.log))
 	}
 }
 
@@ -346,7 +331,6 @@ func (rf *Raft) startElection() {
 	rf.votedFor = rf.me
 	rf.persist()
 	rf.resetElectionTimer()
-	DPrintf("S%d T%d C: starting election", rf.me, rf.curTerm)
 	lastLogIdx, lastLogTerm := rf.lastLogIdxAndTerm()
 	currentTerm := rf.curTerm
 	rf.mu.Unlock()
@@ -483,7 +467,6 @@ func (rf *Raft) callAppendEntries(term int) {
 
 func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	if reply.Term > rf.curTerm {
-		DPrintf("S%d T%d L: received reply with higher term T%d from S%d. Becoming follower.", rf.me, rf.curTerm, reply.Term, peerIdx)
 		rf.becomeFollower(reply.Term)
 		rf.resetElectionTimer()
 		return
@@ -499,7 +482,6 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 			rf.matchIdx[peerIdx] = newMatchIdx
 		}
 		rf.nextIdx[peerIdx] = rf.matchIdx[peerIdx] + 1
-		DPrintf("S%d T%d L: AppendEntries to S%d succeeded. matchIdx=%d, nextIdx=%d", rf.me, rf.curTerm, peerIdx, rf.matchIdx[peerIdx], rf.nextIdx[peerIdx])
 
 		lastCommitIdx := rf.commitIdx
 		rf.tryToCommit()
@@ -509,7 +491,6 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 		return
 	}
 
-	DPrintf("S%d T%d L: AppendEntries to S%d failed. ConflictTerm=%d, ConflictIdx=%d", rf.me, rf.curTerm, peerIdx, reply.ConflictTerm, reply.ConflictIdx)
 	if reply.ConflictTerm >= 0 {
 		lastIdxTerm := -1
 		for i := len(rf.log) - 1; i >= 0; i-- {
@@ -527,7 +508,6 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 	} else {
 		rf.nextIdx[peerIdx] = reply.ConflictIdx
 	}
-	DPrintf("S%d T%d L: updated nextIdx for S%d to %d", rf.me, rf.curTerm, peerIdx, rf.nextIdx[peerIdx])
 }
 
 func (rf *Raft) tryToCommit() {
@@ -547,7 +527,6 @@ func (rf *Raft) tryToCommit() {
 		}
 
 		if count > len(rf.peers)/2 && i > rf.commitIdx {
-			DPrintf("S%d T%d L: committing index %d", rf.me, rf.curTerm, i)
 			rf.commitIdx = i
 		}
 	}
