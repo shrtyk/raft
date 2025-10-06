@@ -175,15 +175,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.Term = rf.curTerm
-	lastLogIdx, lastLogTerm := rf.lastLogIdxAndTerm()
-	logOk := args.LastLogTerm > lastLogTerm ||
-		(args.LastLogTerm == lastLogTerm && args.LastLogIdx >= lastLogIdx)
-	if logOk && (rf.votedFor == votedForNone || rf.votedFor == args.CandidateId) {
+	if rf.isCandidateLogUpToDate(args.LastLogIdx, args.LastLogTerm) &&
+		(rf.votedFor == votedForNone || rf.votedFor == args.CandidateId) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.persist()
 		rf.resetElectionTimer()
 	}
+}
+
+func (rf *Raft) isCandidateLogUpToDate(candidateLastLogIdx, candidateLastLogTerm int) bool {
+	myLastLogIdx, myLastLogTerm := rf.lastLogIdxAndTerm()
+	if candidateLastLogTerm != myLastLogTerm {
+		return candidateLastLogTerm > myLastLogTerm
+	}
+	return candidateLastLogIdx >= myLastLogIdx
 }
 
 func (rf *Raft) sendRequestVoteRPC(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
