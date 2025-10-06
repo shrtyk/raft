@@ -75,6 +75,7 @@ type LogEntry struct {
 	Cmd  any // command for state machine
 }
 
+// GetState returns current term and whether this server believes it is the leader
 func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
@@ -87,6 +88,9 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+// persist saves Raft's persistent state to stable storage
+//
+// caller must hold lock
 func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -99,7 +103,9 @@ func (rf *Raft) persist() {
 	rf.persister.Save(data, nil)
 }
 
-// restore previously persisted state.
+// readPersist restores previously persisted state
+//
+// caller must hold lock
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -158,6 +164,7 @@ type RequestVoteReply struct {
 	VoterId     int
 }
 
+// RequestVote RPC handler
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -184,6 +191,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
+// isCandidateLogUpToDate determines if the candidate's log is at least as up-to-date as receiver's log
+//
+// caller must hold lock
 func (rf *Raft) isCandidateLogUpToDate(candidateLastLogIdx, candidateLastLogTerm int) bool {
 	myLastLogIdx, myLastLogTerm := rf.lastLogIdxAndTerm()
 	if candidateLastLogTerm != myLastLogTerm {
@@ -206,6 +216,7 @@ func (rf *Raft) sendAppendEntriesRPC(
 	return ok
 }
 
+// Start proposes a new command to be replicated
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -235,6 +246,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+// Kill sets the peer to a dead state
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 }
@@ -261,6 +273,7 @@ type RequestAppendEntriesReply struct {
 	ConflictTerm int
 }
 
+// AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -293,6 +306,9 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 	reply.Success = true
 }
 
+// processEntries handles appending/truncating entries to the follower's log
+//
+// caller must hold lock
 func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) {
 	logInsertIdx := args.PrevLogIdx + 1
 	newEntriesIdx := 0
@@ -314,6 +330,9 @@ func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) {
 	}
 }
 
+// fillConflictReply sets the conflict fields in an AppendEntries reply
+//
+// caller must hold lock
 func (rf *Raft) fillConflictReply(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	if args.PrevLogIdx >= len(rf.log) {
 		reply.ConflictIdx = len(rf.log)
@@ -329,6 +348,7 @@ func (rf *Raft) fillConflictReply(args *RequestAppendEntriesArgs, reply *Request
 	}
 }
 
+// startElection begins a new election
 func (rf *Raft) startElection() {
 	timeout := randElectionIntervalMs()
 
@@ -469,6 +489,9 @@ func (rf *Raft) callAppendEntries(term int) {
 	}
 }
 
+// handleAppendEntriesReply processes the reply from an AppendEntries RPC
+//
+// caller must hold lock
 func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	if reply.Term > rf.curTerm {
 		rf.becomeFollower(reply.Term)
@@ -514,6 +537,9 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 	}
 }
 
+// tryToCommit advances the commit index if possible
+//
+// caller must hold lock
 func (rf *Raft) tryToCommit() {
 	for i := rf.commitIdx + 1; i < len(rf.log); i++ {
 		if rf.log[i].Term != rf.curTerm {
@@ -536,6 +562,7 @@ func (rf *Raft) tryToCommit() {
 	}
 }
 
+// ticker is the main state machine loop for a Raft peer
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
@@ -569,6 +596,7 @@ func (rf *Raft) ticker() {
 	}
 }
 
+// applier applies committed log entries to the state machine in the background
 func (rf *Raft) applier() {
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -600,6 +628,9 @@ func (rf *Raft) applier() {
 	}
 }
 
+// lastLogIdxAndTerm returns the index and term of the last entry in the log
+//
+// caller must hold lock
 func (rf *Raft) lastLogIdxAndTerm() (lastLogIdx int, lastLogTerm int) {
 	lastLogIdx, lastLogTerm = -1, -1
 	if len(rf.log) > 0 {
@@ -609,6 +640,9 @@ func (rf *Raft) lastLogIdxAndTerm() (lastLogIdx int, lastLogTerm int) {
 	return
 }
 
+// becomeFollower transitions the peer to the follower state
+//
+// caller must hold lock
 func (rf *Raft) becomeFollower(term int) {
 	rf.state = follower
 	if term > rf.curTerm {
@@ -618,6 +652,9 @@ func (rf *Raft) becomeFollower(term int) {
 	}
 }
 
+// becomeLeader transitions the peer to the leader state
+//
+// caller must hold lock
 func (rf *Raft) becomeLeader() {
 	rf.state = leader
 	lastLogIdx, _ := rf.lastLogIdxAndTerm()
@@ -628,10 +665,16 @@ func (rf *Raft) becomeLeader() {
 	rf.matchIdx[rf.me] = lastLogIdx
 }
 
+// resetElectionTimer resets the election timer
+//
+// caller must hold lock
 func (rf *Raft) resetElectionTimer() {
 	rf.lastLeaderCallAt = time.Now()
 }
 
+// resetHeartbeatTimer resets the heartbeat timer
+//
+// caller must hold lock
 func (rf *Raft) resetHeartbeatTimer() {
 	rf.lastAppendEntriesAt = time.Now()
 }
@@ -640,6 +683,7 @@ func randElectionIntervalMs() time.Duration {
 	return ElectionTimeoutBase + time.Duration(rand.Int63n(int64(ElectionTimeoutRand)))
 }
 
+// Make creates and starts a new Raft peer
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{}
