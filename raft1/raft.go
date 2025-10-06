@@ -418,54 +418,52 @@ func (rf *Raft) callAppendEntries(term int) {
 		}
 
 		go func(peerIdx int) {
-			for !rf.killed() {
+			rf.mu.Lock()
+			if rf.curTerm != term || rf.state != leader {
+				rf.mu.Unlock()
+				return
+			}
+
+			prevLogIdx := rf.nextIdx[peerIdx] - 1
+			prevLogTerm := -1
+			if prevLogIdx >= 0 {
+				if prevLogIdx >= len(rf.log) {
+					rf.mu.Unlock()
+					return
+				}
+				prevLogTerm = rf.log[prevLogIdx].Term
+			}
+			entries := rf.log[rf.nextIdx[peerIdx]:]
+			entriesCopy := make([]LogEntry, len(entries))
+			copy(entriesCopy, entries)
+
+			args := &RequestAppendEntriesArgs{
+				Term:            term,
+				LeaderId:        rf.me,
+				PrevLogIdx:      prevLogIdx,
+				PrevLogTerm:     prevLogTerm,
+				LeaderCommitIdx: rf.commitIdx,
+				Entries:         entriesCopy,
+			}
+			rf.mu.Unlock()
+
+			reply := &RequestAppendEntriesReply{}
+			if rf.sendAppendEntriesRPC(peerIdx, args, reply) {
 				rf.mu.Lock()
 				if rf.curTerm != term || rf.state != leader {
 					rf.mu.Unlock()
 					return
 				}
 
-				prevLogIdx := rf.nextIdx[peerIdx] - 1
-				prevLogTerm := -1
-				if prevLogIdx >= 0 {
-					if prevLogIdx >= len(rf.log) {
-						rf.mu.Unlock()
-						return
-					}
-					prevLogTerm = rf.log[prevLogIdx].Term
-				}
-				entries := rf.log[rf.nextIdx[peerIdx]:]
-				entriesCopy := make([]LogEntry, len(entries))
-				copy(entriesCopy, entries)
+				rf.handleAppendEntriesReply(peerIdx, args, reply)
 
-				args := &RequestAppendEntriesArgs{
-					Term:            term,
-					LeaderId:        rf.me,
-					PrevLogIdx:      prevLogIdx,
-					PrevLogTerm:     prevLogTerm,
-					LeaderCommitIdx: rf.commitIdx,
-					Entries:         entriesCopy,
-				}
-				rf.mu.Unlock()
-
-				reply := &RequestAppendEntriesReply{}
-				if rf.sendAppendEntriesRPC(peerIdx, args, reply) {
-					rf.mu.Lock()
-					if rf.curTerm != term || rf.state != leader {
-						rf.mu.Unlock()
-						return
-					}
-
-					rf.handleAppendEntriesReply(peerIdx, args, reply)
-
-					if reply.Success {
-						rf.mu.Unlock()
-						return
-					}
+				if reply.Success {
 					rf.mu.Unlock()
-				} else {
 					return
 				}
+				rf.mu.Unlock()
+			} else {
+				return
 			}
 		}(i)
 	}
