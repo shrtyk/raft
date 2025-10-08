@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -68,6 +69,9 @@ type Raft struct {
 	nextIdx []int
 	// for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 	matchIdx []int
+
+	lastIncludedIndex int
+	lastIncludedTerm  int
 }
 
 type LogEntry struct {
@@ -98,6 +102,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.curTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 
 	data := w.Bytes()
 	rf.persister.Save(data, nil)
@@ -114,30 +120,39 @@ func (rf *Raft) readPersist(data []byte) {
 	b := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(b)
 
-	term, votedFor, log, err := decodeData(d)
-	if err != nil {
+	var term, votedFor, lastIncludedIndex, lastIncludedTerm int
+	var l []LogEntry
+
+	if err := d.Decode(&term); err != nil {
+		log.Println(err)
+		return
+	}
+
+	if err := d.Decode(&votedFor); err != nil {
+		log.Println(err)
+		return
+	}
+
+	if err := d.Decode(&l); err != nil {
+		log.Println(err)
+		return
+	}
+
+	if err := d.Decode(&lastIncludedIndex); err != nil {
+		log.Println(err)
+		return
+	}
+
+	if err := d.Decode(&lastIncludedTerm); err != nil {
+		log.Println(err)
 		return
 	}
 
 	rf.curTerm = term
 	rf.votedFor = votedFor
-	rf.log = log
-}
-
-func decodeData(decoder *labgob.LabDecoder) (term int, votedFor int, log []LogEntry, err error) {
-	if e := decoder.Decode(&term); e != nil {
-		err = e
-		return
-	}
-	if e := decoder.Decode(&votedFor); e != nil {
-		err = e
-		return
-	}
-	if e := decoder.Decode(&log); e != nil {
-		err = e
-		return
-	}
-	return
+	rf.log = l
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
 }
 
 func (rf *Raft) PersistBytes() int {
