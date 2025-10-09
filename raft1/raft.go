@@ -41,10 +41,6 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (3A, 3B, 3C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-
 	state               State
 	lastLeaderCallAt    time.Time // last time got leader call
 	lastAppendEntriesAt time.Time // last time leader sent Append Entries
@@ -70,8 +66,8 @@ type Raft struct {
 	// for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 	matchIdx []int
 
-	lastIncludedIndex int
-	lastIncludedTerm  int
+	lastIncludedIndex int // the index of the last entry in the log that the snapshot replaces
+	lastIncludedTerm  int // the term of the last entry in the log that the snapshot replaces
 }
 
 type LogEntry struct {
@@ -311,32 +307,28 @@ func (rf *Raft) sendAppendEntriesRPC(
 
 // Start proposes a new command to be replicated
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	isLeader = rf.state == leader
-	term = rf.curTerm
+	isLeader := rf.state == leader
+	term := rf.curTerm
 	if !isLeader {
-		rf.mu.Unlock()
-		// redirect to leader node
-		return index, term, isLeader
+		return -1, term, false
 	}
 
-	DPrintf("S%d T%d L: received new command", rf.me, rf.curTerm)
 	rf.log = append(rf.log, LogEntry{
 		Term: rf.curTerm,
 		Cmd:  command,
 	})
 	rf.persist()
-	index = len(rf.log)
-	rf.matchIdx[rf.me] = index - 1
-	rf.mu.Unlock()
-	rf.sendAppendEntries()
 
-	return index, term, isLeader
+	lastLogIdx, _ := rf.lastLogIdxAndTerm()
+	rf.matchIdx[rf.me] = lastLogIdx
+	rf.nextIdx[rf.me] = lastLogIdx + 1
+
+	go rf.sendAppendEntries()
+
+	return lastLogIdx, term, isLeader
 }
 
 // Kill sets the peer to a dead state
@@ -384,14 +376,21 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 
 	rf.resetElectionTimer()
 	reply.Term = rf.curTerm
-	if args.PrevLogIdx >= 0 && (args.PrevLogIdx >= len(rf.log) || rf.log[args.PrevLogIdx].Term != args.PrevLogTerm) {
+
+	if args.PrevLogIdx < rf.lastIncludedIndex {
+		reply.Success = false
+		return
+	}
+
+	lastLogAbsIdx, _ := rf.lastLogIdxAndTerm()
+	if args.PrevLogIdx > lastLogAbsIdx || (args.PrevLogIdx >= rf.lastIncludedIndex && rf.getTerm(args.PrevLogIdx) != args.PrevLogTerm) {
 		rf.fillConflictReply(args, reply)
 		return
 	}
 
 	rf.processEntries(args)
 	if args.LeaderCommitIdx > rf.commitIdx {
-		lastLogIndex := len(rf.log) - 1
+		lastLogIndex, _ := rf.lastLogIdxAndTerm()
 		rf.commitIdx = min(args.LeaderCommitIdx, lastLogIndex)
 		rf.commitCond.Broadcast()
 	}
