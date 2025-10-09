@@ -398,24 +398,22 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 //
 // caller must hold lock
 func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) {
-	logInsertIdx := args.PrevLogIdx + 1
-	newEntriesIdx := 0
-
-	for {
-		if logInsertIdx >= len(rf.log) || newEntriesIdx >= len(args.Entries) {
+	for i, entry := range args.Entries {
+		absIdx := args.PrevLogIdx + 1 + i
+		lastAbsIdx, _ := rf.lastLogIdxAndTerm()
+		if absIdx > lastAbsIdx {
+			rf.log = append(rf.log, args.Entries[i:]...)
 			break
 		}
-		if rf.log[logInsertIdx].Term != args.Entries[newEntriesIdx].Term {
+
+		if rf.getTerm(absIdx) != entry.Term {
+			sliceIdx := absIdx - rf.lastIncludedIndex - 1
+			rf.log = rf.log[:sliceIdx]
+			rf.log = append(rf.log, args.Entries[i:]...)
 			break
 		}
-		logInsertIdx++
-		newEntriesIdx++
 	}
-
-	if newEntriesIdx < len(args.Entries) {
-		rf.log = append(rf.log[:logInsertIdx], args.Entries[newEntriesIdx:]...)
-		rf.persist()
-	}
+	rf.persist()
 }
 
 // fillConflictReply sets the conflict fields in an AppendEntries reply
