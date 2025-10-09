@@ -68,6 +68,8 @@ type Raft struct {
 
 	lastIncludedIndex int // the index of the last entry in the log that the snapshot replaces
 	lastIncludedTerm  int // the term of the last entry in the log that the snapshot replaces
+
+	killChan chan struct{} // channel to signal instance killed
 }
 
 type LogEntry struct {
@@ -225,14 +227,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.lastAppliedIdx = args.LastIncludedIndex
 	}
 
-	go func() {
-		rf.applyChan <- raftapi.ApplyMsg{
-			SnapshotValid: true,
-			Snapshot:      args.Data,
-			SnapshotTerm:  rf.lastIncludedTerm,
-			SnapshotIndex: rf.lastIncludedIndex,
-		}
-	}()
+	rf.commitCond.Broadcast()
 }
 
 func (rf *Raft) sendInstallSnapshotRPC(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -334,6 +329,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // Kill sets the peer to a dead state
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
+	close(rf.killChan)
 }
 
 func (rf *Raft) killed() bool {
@@ -688,7 +684,7 @@ func (rf *Raft) ticker() {
 	}
 }
 
-// applier applies committed log entries to the state machine in the background
+// applies committed log entries to the state machine in the background
 func (rf *Raft) applier() {
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -720,14 +716,34 @@ func (rf *Raft) applier() {
 	}
 }
 
-// lastLogIdxAndTerm returns the index and term of the last entry in the log
+// getTerm returns the term of a log entry at a given absolute index.
+// It handles cases where the index is part of a snapshot.
 //
 // caller must hold lock
+func (rf *Raft) getTerm(idx int) int {
+	if idx == rf.lastIncludedIndex {
+		return rf.lastIncludedTerm
+	}
+
+	if idx < rf.lastIncludedIndex {
+		return -1
+	}
+
+	sliceIndex := idx - rf.lastIncludedIndex - 1
+	if sliceIndex >= len(rf.log) {
+		return -1
+	}
+	return rf.log[sliceIndex].Term
+}
+
+// lastLogIdxAndTerm returns the index and term of the last entry in the log
 func (rf *Raft) lastLogIdxAndTerm() (lastLogIdx int, lastLogTerm int) {
-	lastLogIdx, lastLogTerm = -1, -1
 	if len(rf.log) > 0 {
-		lastLogIdx = len(rf.log) - 1
-		lastLogTerm = rf.log[lastLogIdx].Term
+		lastLogIdx = rf.lastIncludedIndex + len(rf.log)
+		lastLogTerm = rf.log[len(rf.log)-1].Term
+	} else {
+		lastLogIdx = rf.lastIncludedIndex
+		lastLogTerm = rf.lastIncludedTerm
 	}
 	return
 }
@@ -752,7 +768,7 @@ func (rf *Raft) becomeLeader() {
 	lastLogIdx, _ := rf.lastLogIdxAndTerm()
 	for i := range rf.peers {
 		rf.nextIdx[i] = lastLogIdx + 1
-		rf.matchIdx[i] = -1
+		rf.matchIdx[i] = 0
 	}
 	rf.matchIdx[rf.me] = lastLogIdx
 }
@@ -784,20 +800,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	rf.commitCond = sync.NewCond(&rf.mu)
+	rf.killChan = make(chan struct{})
 
 	rf.state = follower
 	rf.lastLeaderCallAt = time.Now()
 	rf.log = make([]LogEntry, 0)
-	rf.commitIdx = -1
-	rf.lastAppliedIdx = -1
 	rf.applyChan = applyCh
-	rf.nextIdx = make([]int, len(peers))
-	rf.matchIdx = make([]int, len(peers))
-	for i := range rf.matchIdx {
-		rf.matchIdx[i] = -1
-	}
 
 	rf.readPersist(persister.ReadRaftState())
+
+	lastLogIdx, _ := rf.lastLogIdxAndTerm()
+	rf.nextIdx = make([]int, len(peers))
+	for i := range rf.nextIdx {
+		rf.nextIdx[i] = lastLogIdx + 1
+	}
+	rf.matchIdx = make([]int, len(peers))
 
 	go rf.applier()
 	go rf.ticker()
