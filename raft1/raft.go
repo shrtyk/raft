@@ -81,15 +81,9 @@ type LogEntry struct {
 
 // GetState returns current term and whether this server believes it is the leader
 func (rf *Raft) GetState() (int, bool) {
-	var term int
-	var isleader bool
-
 	rf.mu.Lock()
-	term = rf.curTerm
-	isleader = rf.state == leader
-	rf.mu.Unlock()
-
-	return term, isleader
+	defer rf.mu.Unlock()
+	return rf.curTerm, rf.state == leader
 }
 
 // persist saves Raft's persistent state to stable storage
