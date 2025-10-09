@@ -139,9 +139,109 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
+// Snapshot is called by the service to save a snapshot.
+// It saves the snapshot and truncates the log
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// TODO
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if index <= rf.lastIncludedIndex {
+		return
+	}
+
+	sliceIndex := index - rf.lastIncludedIndex
+	rf.lastIncludedTerm = rf.log[sliceIndex-1].Term
+
+	newLog := make([]LogEntry, len(rf.log[sliceIndex:]))
+	copy(newLog, rf.log[sliceIndex:])
+	rf.log = newLog
+
+	rf.lastIncludedIndex = index
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.curTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	data := w.Bytes()
+	rf.persister.Save(data, snapshot)
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.curTerm
+	if args.Term < rf.curTerm {
+		return
+	}
+
+	if args.Term > rf.curTerm {
+		rf.becomeFollower(args.Term)
+	}
+	rf.resetElectionTimer()
+
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+		return
+	}
+
+	lastLogAbsIdx, _ := rf.lastLogIdxAndTerm()
+	if lastLogAbsIdx > args.LastIncludedIndex && rf.getTerm(args.LastIncludedIndex) == args.LastIncludedTerm {
+		sliceIndex := args.LastIncludedIndex - rf.lastIncludedIndex
+		newLog := make([]LogEntry, len(rf.log[sliceIndex:]))
+		copy(newLog, rf.log[sliceIndex:])
+		rf.log = newLog
+	} else {
+		rf.log = make([]LogEntry, 0)
+	}
+
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.curTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	raftState := w.Bytes()
+	rf.persister.Save(raftState, args.Data)
+
+	if rf.commitIdx < args.LastIncludedIndex {
+		rf.commitIdx = args.LastIncludedIndex
+	}
+	if rf.lastAppliedIdx < args.LastIncludedIndex {
+		rf.lastAppliedIdx = args.LastIncludedIndex
+	}
+
+	go func() {
+		rf.applyChan <- raftapi.ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Data,
+			SnapshotTerm:  rf.lastIncludedTerm,
+			SnapshotIndex: rf.lastIncludedIndex,
+		}
+	}()
+}
+
+func (rf *Raft) sendInstallSnapshotRPC(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
 }
 
 type RequestVoteArgs struct {
