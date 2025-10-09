@@ -100,7 +100,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.lastIncludedTerm)
 
 	data := w.Bytes()
-	rf.persister.Save(data, nil)
+	rf.persister.Save(data, rf.persister.ReadSnapshot())
 }
 
 // readPersist restores previously persisted state
@@ -117,29 +117,10 @@ func (rf *Raft) readPersist(data []byte) {
 	var term, votedFor, lastIncludedIndex, lastIncludedTerm int
 	var l []LogEntry
 
-	if err := d.Decode(&term); err != nil {
-		log.Println(err)
-		return
-	}
-
-	if err := d.Decode(&votedFor); err != nil {
-		log.Println(err)
-		return
-	}
-
-	if err := d.Decode(&l); err != nil {
-		log.Println(err)
-		return
-	}
-
-	if err := d.Decode(&lastIncludedIndex); err != nil {
-		log.Println(err)
-		return
-	}
-
-	if err := d.Decode(&lastIncludedTerm); err != nil {
-		log.Println(err)
-		return
+	if d.Decode(&term) != nil || d.Decode(&votedFor) != nil ||
+		d.Decode(&l) != nil || d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil {
+		log.Fatal("readPersist: decode error")
 	}
 
 	rf.curTerm = term
@@ -147,6 +128,9 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.log = l
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
+
+	rf.commitIdx = rf.lastIncludedIndex
+	rf.lastAppliedIdx = rf.lastIncludedIndex
 }
 
 func (rf *Raft) PersistBytes() int {
