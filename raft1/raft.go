@@ -417,14 +417,14 @@ func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) {
 //
 // caller must hold lock
 func (rf *Raft) fillConflictReply(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
-	if args.PrevLogIdx >= len(rf.log) {
-		reply.ConflictIdx = len(rf.log)
+	lastLogIdx, _ := rf.lastLogIdxAndTerm()
+	if args.PrevLogIdx > lastLogIdx {
+		reply.ConflictIdx = lastLogIdx + 1
 		reply.ConflictTerm = -1
 	} else {
-		reply.ConflictTerm = rf.log[args.PrevLogIdx].Term
-
+		reply.ConflictTerm = rf.getTerm(args.PrevLogIdx)
 		firstIndexOfTerm := args.PrevLogIdx
-		for firstIndexOfTerm > 0 && rf.log[firstIndexOfTerm-1].Term == reply.ConflictTerm {
+		for firstIndexOfTerm > rf.lastIncludedIndex+1 && rf.getTerm(firstIndexOfTerm-1) == reply.ConflictTerm {
 			firstIndexOfTerm--
 		}
 		reply.ConflictIdx = firstIndexOfTerm
@@ -519,7 +519,6 @@ func (rf *Raft) callAppendEntries(term int) {
 		if i == rf.me {
 			continue
 		}
-
 		go func(peerIdx int) {
 			rf.mu.Lock()
 			if rf.curTerm != term || rf.state != leader {
@@ -527,48 +526,79 @@ func (rf *Raft) callAppendEntries(term int) {
 				return
 			}
 
-			prevLogIdx := rf.nextIdx[peerIdx] - 1
-			prevLogTerm := -1
-			if prevLogIdx >= 0 {
-				if prevLogIdx >= len(rf.log) {
-					rf.mu.Unlock()
-					return
-				}
-				prevLogTerm = rf.log[prevLogIdx].Term
-			}
-			entries := rf.log[rf.nextIdx[peerIdx]:]
-			entriesCopy := make([]LogEntry, len(entries))
-			copy(entriesCopy, entries)
-
-			args := &RequestAppendEntriesArgs{
-				Term:            term,
-				LeaderId:        rf.me,
-				PrevLogIdx:      prevLogIdx,
-				PrevLogTerm:     prevLogTerm,
-				LeaderCommitIdx: rf.commitIdx,
-				Entries:         entriesCopy,
-			}
-			rf.mu.Unlock()
-
-			reply := &RequestAppendEntriesReply{}
-			if rf.sendAppendEntriesRPC(peerIdx, args, reply) {
-				rf.mu.Lock()
-				if rf.curTerm != term || rf.state != leader {
-					rf.mu.Unlock()
-					return
-				}
-
-				rf.handleAppendEntriesReply(peerIdx, args, reply)
-
-				if reply.Success {
-					rf.mu.Unlock()
-					return
-				}
-				rf.mu.Unlock()
+			if rf.nextIdx[peerIdx] <= rf.lastIncludedIndex {
+				rf.leaderSendSnapshot(peerIdx)
 			} else {
-				return
+				rf.leaderSendEntries(peerIdx)
 			}
 		}(i)
+	}
+}
+
+// leaderSendSnapshot handles sending a snapshot to a single peer.
+//
+// Assumes the lock is held when called
+func (rf *Raft) leaderSendSnapshot(peerIdx int) {
+	args := &InstallSnapshotArgs{
+		Term:              rf.curTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.lastIncludedTerm,
+		Data:              rf.persister.ReadSnapshot(),
+	}
+	rf.mu.Unlock()
+
+	reply := &InstallSnapshotReply{}
+	if rf.sendInstallSnapshotRPC(peerIdx, args, reply) {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		if rf.curTerm != args.Term {
+			return
+		}
+
+		if reply.Term > rf.curTerm {
+			rf.becomeFollower(reply.Term)
+			rf.resetElectionTimer()
+			return
+		}
+
+		rf.matchIdx[peerIdx] = max(rf.matchIdx[peerIdx], args.LastIncludedIndex)
+		rf.nextIdx[peerIdx] = rf.matchIdx[peerIdx] + 1
+	}
+}
+
+// leaderSendEntries handles sending log entries to a single peer.
+//
+// Assumes the lock is held when called
+func (rf *Raft) leaderSendEntries(peerIdx int) {
+	prevLogIdx := rf.nextIdx[peerIdx] - 1
+	prevLogTerm := rf.getTerm(prevLogIdx)
+
+	sliceIndex := rf.nextIdx[peerIdx] - rf.lastIncludedIndex - 1
+	entries := make([]LogEntry, len(rf.log[sliceIndex:]))
+	copy(entries, rf.log[sliceIndex:])
+
+	args := &RequestAppendEntriesArgs{
+		Term:            rf.curTerm,
+		LeaderId:        rf.me,
+		PrevLogIdx:      prevLogIdx,
+		PrevLogTerm:     prevLogTerm,
+		LeaderCommitIdx: rf.commitIdx,
+		Entries:         entries,
+	}
+	rf.mu.Unlock()
+
+	reply := &RequestAppendEntriesReply{}
+	if rf.sendAppendEntriesRPC(peerIdx, args, reply) {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		if rf.curTerm != args.Term {
+			return
+		}
+
+		rf.handleAppendEntriesReply(peerIdx, args, reply)
 	}
 }
 
@@ -603,8 +633,9 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 
 	if reply.ConflictTerm >= 0 {
 		lastIdxTerm := -1
-		for i := len(rf.log) - 1; i >= 0; i-- {
-			if rf.log[i].Term == reply.ConflictTerm {
+		lastLogIdx, _ := rf.lastLogIdxAndTerm()
+		for i := lastLogIdx; i > rf.lastIncludedIndex; i-- {
+			if rf.getTerm(i) == reply.ConflictTerm {
 				lastIdxTerm = i
 				break
 			}
@@ -620,12 +651,10 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 	}
 }
 
-// tryToCommit advances the commit index if possible
-//
-// caller must hold lock
 func (rf *Raft) tryToCommit() {
-	for i := rf.commitIdx + 1; i < len(rf.log); i++ {
-		if rf.log[i].Term != rf.curTerm {
+	lastLogIdx, _ := rf.lastLogIdxAndTerm()
+	for i := rf.commitIdx + 1; i <= lastLogIdx; i++ {
+		if rf.getTerm(i) != rf.curTerm {
 			continue
 		}
 
@@ -661,7 +690,6 @@ func (rf *Raft) ticker() {
 			rf.mu.Lock()
 			if rf.state == follower && time.Since(rf.lastLeaderCallAt) >= timeout {
 				rf.state = candidate
-				DPrintf("S%d T%d F: election timeout", rf.me, rf.curTerm)
 			}
 			rf.mu.Unlock()
 		case candidate:
@@ -683,31 +711,47 @@ func (rf *Raft) ticker() {
 func (rf *Raft) applier() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for rf.commitIdx <= rf.lastAppliedIdx && !rf.killed() {
+		for rf.lastAppliedIdx >= rf.commitIdx && rf.lastAppliedIdx >= rf.lastIncludedIndex {
 			rf.commitCond.Wait()
+			if rf.killed() {
+				rf.mu.Unlock()
+				return
+			}
 		}
 
-		lastApplied := rf.lastAppliedIdx
-		commitIdx := rf.commitIdx
-		if commitIdx <= lastApplied {
-			rf.mu.Unlock()
-			continue
-		}
+		var msg raftapi.ApplyMsg
 
-		msgs := make([]raftapi.ApplyMsg, 0, commitIdx-lastApplied)
-		for i := lastApplied + 1; i <= commitIdx; i++ {
-			msgs = append(msgs, raftapi.ApplyMsg{
+		if rf.lastAppliedIdx < rf.lastIncludedIndex {
+			msg = raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.persister.ReadSnapshot(),
+				SnapshotTerm:  rf.lastIncludedTerm,
+				SnapshotIndex: rf.lastIncludedIndex,
+			}
+		} else {
+			applyIdx := rf.lastAppliedIdx + 1
+			sliceIdx := applyIdx - rf.lastIncludedIndex - 1
+			msg = raftapi.ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[i].Cmd,
-				CommandIndex: i + 1,
-			})
+				Command:      rf.log[sliceIdx].Cmd,
+				CommandIndex: applyIdx,
+			}
 		}
 		rf.mu.Unlock()
 
-		for _, msg := range msgs {
-			rf.applyChan <- msg
+		select {
+		case <-rf.killChan:
+			return
+		case rf.applyChan <- msg:
 		}
-		rf.lastAppliedIdx = commitIdx
+
+		rf.mu.Lock()
+		if msg.SnapshotValid {
+			rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
+		} else {
+			rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.CommandIndex)
+		}
+		rf.mu.Unlock()
 	}
 }
 
