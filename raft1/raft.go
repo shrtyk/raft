@@ -223,9 +223,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if rf.commitIdx < args.LastIncludedIndex {
 		rf.commitIdx = args.LastIncludedIndex
 	}
-	if rf.lastAppliedIdx < args.LastIncludedIndex {
-		rf.lastAppliedIdx = args.LastIncludedIndex
-	}
 
 	rf.commitCond.Broadcast()
 }
