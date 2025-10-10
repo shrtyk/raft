@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"context"
 	"log"
 	"math/rand"
 	"sync"
@@ -69,7 +70,8 @@ type Raft struct {
 	lastIncludedIndex int // the index of the last entry in the log that the snapshot replaces
 	lastIncludedTerm  int // the term of the last entry in the log that the snapshot replaces
 
-	killChan chan struct{} // channel to signal instance killed
+	killCtx    context.Context
+	killCancel func()
 }
 
 type LogEntry struct {
@@ -137,8 +139,6 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-// Snapshot is called by the service to save a snapshot.
-// It saves the snapshot and truncates the log
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -147,14 +147,19 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
-	sliceIndex := index - rf.lastIncludedIndex
-	rf.lastIncludedTerm = rf.log[sliceIndex-1].Term
+	// Determine the term of the snapshot point
+	term := rf.getTerm(index)
 
-	newLog := make([]LogEntry, len(rf.log[sliceIndex:]))
-	copy(newLog, rf.log[sliceIndex:])
-	rf.log = newLog
+	// Cut the log to keep entries after index
+	sliceIndex := index - rf.lastIncludedIndex
+	if sliceIndex < len(rf.log) {
+		rf.log = append([]LogEntry(nil), rf.log[sliceIndex:]...)
+	} else {
+		rf.log = nil
+	}
 
 	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = term
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -197,14 +202,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
-	lastLogAbsIdx, _ := rf.lastLogIdxAndTerm()
-	if lastLogAbsIdx > args.LastIncludedIndex && rf.getTerm(args.LastIncludedIndex) == args.LastIncludedTerm {
-		sliceIndex := args.LastIncludedIndex - rf.lastIncludedIndex
-		newLog := make([]LogEntry, len(rf.log[sliceIndex:]))
-		copy(newLog, rf.log[sliceIndex:])
-		rf.log = newLog
+
+	sliceIndex := args.LastIncludedIndex - rf.lastIncludedIndex
+	if sliceIndex < len(rf.log) && rf.getTerm(args.LastIncludedIndex) == args.LastIncludedTerm {
+		rf.log = append([]LogEntry(nil), rf.log[sliceIndex:]...)
 	} else {
-		rf.log = make([]LogEntry, 0)
+		rf.log = nil
 	}
 
 	rf.lastIncludedIndex = args.LastIncludedIndex
@@ -326,7 +329,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // Kill sets the peer to a dead state
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	close(rf.killChan)
+	rf.killCancel()
+	rf.commitCond.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -675,83 +679,91 @@ func (rf *Raft) tryToCommit() {
 }
 
 // ticker is the main state machine loop for a Raft peer
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
-
-		rf.mu.Lock()
-		state := rf.state
-		rf.mu.Unlock()
-
-		switch state {
-		case follower:
-			timeout := randElectionIntervalMs()
-			time.Sleep(timeout)
-
+func (rf *Raft) ticker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
 			rf.mu.Lock()
-			if rf.state == follower && time.Since(rf.lastLeaderCallAt) >= timeout {
-				rf.state = candidate
-			}
+			state := rf.state
 			rf.mu.Unlock()
-		case candidate:
-			rf.startElection()
-		case leader:
-			time.Sleep(HeartbeatInterval)
-			rf.mu.Lock()
-			if time.Since(rf.lastAppendEntriesAt) >= HeartbeatInterval {
+			switch state {
+			case follower:
+				timeout := randElectionIntervalMs()
+				time.Sleep(timeout)
+
+				rf.mu.Lock()
+				if !rf.killed() && rf.state == follower && time.Since(rf.lastLeaderCallAt) >= timeout {
+					rf.state = candidate
+				}
 				rf.mu.Unlock()
-				rf.sendAppendEntries()
-			} else {
-				rf.mu.Unlock()
+			case candidate:
+				rf.startElection()
+			case leader:
+				time.Sleep(HeartbeatInterval)
+				rf.mu.Lock()
+				if !rf.killed() && time.Since(rf.lastAppendEntriesAt) >= HeartbeatInterval {
+					rf.mu.Unlock()
+					rf.sendAppendEntries()
+				} else {
+					rf.mu.Unlock()
+				}
 			}
 		}
 	}
 }
 
 // applies committed log entries to the state machine in the background
-func (rf *Raft) applier() {
-	for !rf.killed() {
-		rf.mu.Lock()
-		for rf.lastAppliedIdx >= rf.commitIdx && rf.lastAppliedIdx >= rf.lastIncludedIndex {
-			rf.commitCond.Wait()
-			if rf.killed() {
-				rf.mu.Unlock()
-				return
-			}
-		}
-
-		var msg raftapi.ApplyMsg
-
-		if rf.lastAppliedIdx < rf.lastIncludedIndex {
-			msg = raftapi.ApplyMsg{
-				SnapshotValid: true,
-				Snapshot:      rf.persister.ReadSnapshot(),
-				SnapshotTerm:  rf.lastIncludedTerm,
-				SnapshotIndex: rf.lastIncludedIndex,
-			}
-		} else {
-			applyIdx := rf.lastAppliedIdx + 1
-			sliceIdx := applyIdx - rf.lastIncludedIndex - 1
-			msg = raftapi.ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[sliceIdx].Cmd,
-				CommandIndex: applyIdx,
-			}
-		}
-		rf.mu.Unlock()
-
+func (rf *Raft) applier(ctx context.Context) {
+	for {
 		select {
-		case <-rf.killChan:
+		case <-ctx.Done():
 			return
-		case rf.applyChan <- msg:
-		}
+		default:
+			rf.mu.Lock()
+			for rf.lastAppliedIdx >= rf.commitIdx && rf.lastAppliedIdx >= rf.lastIncludedIndex {
+				rf.commitCond.Wait()
+				if rf.killed() {
+					rf.mu.Unlock()
+					return
+				}
+			}
 
-		rf.mu.Lock()
-		if msg.SnapshotValid {
-			rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
-		} else {
-			rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.CommandIndex)
+			var msg raftapi.ApplyMsg
+
+			if rf.lastAppliedIdx < rf.lastIncludedIndex {
+				msg = raftapi.ApplyMsg{
+					SnapshotValid: true,
+					Snapshot:      rf.persister.ReadSnapshot(),
+					SnapshotTerm:  rf.lastIncludedTerm,
+					SnapshotIndex: rf.lastIncludedIndex,
+				}
+			} else {
+				applyIdx := rf.lastAppliedIdx + 1
+				sliceIdx := applyIdx - rf.lastIncludedIndex - 1
+				msg = raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[sliceIdx].Cmd,
+					CommandIndex: applyIdx,
+				}
+			}
+			rf.mu.Unlock()
+
+			select {
+			case <-ctx.Done():
+				return
+			case rf.applyChan <- msg:
+			}
+
+			rf.mu.Lock()
+			if msg.SnapshotValid {
+				rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
+			} else {
+				rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.CommandIndex)
+			}
+			rf.mu.Unlock()
 		}
-		rf.mu.Unlock()
 	}
 }
 
@@ -838,8 +850,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	ctx, cancel := context.WithCancel(context.Background())
+	rf.killCtx = ctx
+	rf.killCancel = cancel
 	rf.commitCond = sync.NewCond(&rf.mu)
-	rf.killChan = make(chan struct{})
 
 	rf.state = follower
 	rf.lastLeaderCallAt = time.Now()
@@ -855,8 +869,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	rf.matchIdx = make([]int, len(peers))
 
-	go rf.applier()
-	go rf.ticker()
+	go rf.applier(ctx)
+	go rf.ticker(ctx)
 
 	return rf
 }
