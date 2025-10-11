@@ -15,7 +15,7 @@ import (
 	tester "github.com/shrtyk/raft/tester1"
 )
 
-type State = int32
+type State = uint32
 
 const (
 	_ State = iota
@@ -36,10 +36,10 @@ const (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *tester.Persister   // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+	me        int64               // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
 	state               State
@@ -51,8 +51,8 @@ type Raft struct {
 
 	// Persistent state:
 
-	curTerm  int        // latest term server has seen
-	votedFor int        // index of peer in peers
+	curTerm  int64      // latest term server has seen
+	votedFor int64      // index of peer in peers
 	log      []LogEntry // log entries
 
 	// Volatile state on all servers:
@@ -67,23 +67,23 @@ type Raft struct {
 	// for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 	matchIdx []int
 
-	lastIncludedIndex int // the index of the last entry in the log that the snapshot replaces
-	lastIncludedTerm  int // the term of the last entry in the log that the snapshot replaces
+	lastIncludedIndex int   // the index of the last entry in the log that the snapshot replaces
+	lastIncludedTerm  int64 // the term of the last entry in the log that the snapshot replaces
 
 	killCtx    context.Context
 	killCancel func()
 }
 
 type LogEntry struct {
-	Term int // term when entry was received
-	Cmd  any // command for state machine
+	Term int64 // term when entry was received
+	Cmd  any   // command for state machine
 }
 
 // GetState returns current term and whether this server believes it is the leader
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.curTerm, rf.state == leader
+	return int(rf.curTerm), rf.state == leader
 }
 
 // persist saves Raft's persistent state to stable storage
@@ -114,7 +114,8 @@ func (rf *Raft) readPersist(data []byte) {
 	b := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(b)
 
-	var term, votedFor, lastIncludedIndex, lastIncludedTerm int
+	var term, lastIncludedTerm, votedFor int64
+	var lastIncludedIndex int
 	var l []LogEntry
 
 	if d.Decode(&term) != nil || d.Decode(&votedFor) != nil ||
@@ -173,15 +174,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 type InstallSnapshotArgs struct {
-	Term              int
-	LeaderId          int
+	Term              int64
+	LeaderId          int64
 	LastIncludedIndex int
-	LastIncludedTerm  int
+	LastIncludedTerm  int64
 	Data              []byte
 }
 
 type InstallSnapshotReply struct {
-	Term int
+	Term int64
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
@@ -201,7 +202,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.LastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
-
 
 	sliceIndex := args.LastIncludedIndex - rf.lastIncludedIndex
 	if sliceIndex < len(rf.log) && rf.getTerm(args.LastIncludedIndex) == args.LastIncludedTerm {
@@ -236,16 +236,16 @@ func (rf *Raft) sendInstallSnapshotRPC(server int, args *InstallSnapshotArgs, re
 }
 
 type RequestVoteArgs struct {
-	Term        int // candidate’s term
-	CandidateId int // candidate requesting vote
-	LastLogIdx  int // index of candidate’s last log entry
-	LastLogTerm int // term of candidate’s last log entry
+	Term        int64 // candidate’s term
+	CandidateId int64 // candidate requesting vote
+	LastLogIdx  int   // index of candidate’s last log entry
+	LastLogTerm int64 // term of candidate’s last log entry
 }
 
 type RequestVoteReply struct {
-	Term        int
+	Term        int64
 	VoteGranted bool
-	VoterId     int
+	VoterId     int64
 }
 
 // RequestVote RPC handler
@@ -278,7 +278,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // isCandidateLogUpToDate determines if the candidate's log is at least as up-to-date as receiver's log
 //
 // caller must hold lock
-func (rf *Raft) isCandidateLogUpToDate(candidateLastLogIdx, candidateLastLogTerm int) bool {
+func (rf *Raft) isCandidateLogUpToDate(candidateLastLogIdx int, candidateLastLogTerm int64) bool {
 	myLastLogIdx, myLastLogTerm := rf.lastLogIdxAndTerm()
 	if candidateLastLogTerm != myLastLogTerm {
 		return candidateLastLogTerm > myLastLogTerm
@@ -308,7 +308,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := rf.state == leader
 	term := rf.curTerm
 	if !isLeader {
-		return -1, term, false
+		return -1, int(term), false
 	}
 
 	rf.log = append(rf.log, LogEntry{
@@ -323,7 +323,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	go rf.sendAppendEntries()
 
-	return lastLogIdx, term, isLeader
+	return lastLogIdx, int(term), isLeader
 }
 
 // Kill sets the peer to a dead state
@@ -339,20 +339,20 @@ func (rf *Raft) killed() bool {
 }
 
 type RequestAppendEntriesArgs struct {
-	Term            int        // leader term
-	LeaderId        int        // for riderection
-	PrevLogTerm     int        // term of prevLogIdx entry
+	Term            int64      // leader term
+	LeaderId        int64      // for riderection
+	PrevLogTerm     int64      // term of prevLogIdx entry
 	PrevLogIdx      int        // index of log entry immidiately preceding new ones
 	LeaderCommitIdx int        // leader's commit index
 	Entries         []LogEntry // log entries to store (empty for heartbeat)
 }
 
 type RequestAppendEntriesReply struct {
-	Term    int  // current term for leader to update itself
-	Success bool // true if follower contained entry matching prevLogIdx and prevLogTerm
+	Term    int64 // current term for leader to update itself
+	Success bool  // true if follower contained entry matching prevLogIdx and prevLogTerm
 
 	ConflictIdx  int
-	ConflictTerm int
+	ConflictTerm int64
 }
 
 // AppendEntries RPC handler
@@ -456,7 +456,7 @@ func (rf *Raft) startElection() {
 		LastLogTerm: lastLogTerm,
 	}
 	for i := range rf.peers {
-		if i == rf.me {
+		if i == int(rf.me) {
 			continue
 		}
 		go func(idx int) {
@@ -518,9 +518,9 @@ func (rf *Raft) sendAppendEntries() {
 	rf.callAppendEntries(curTerm)
 }
 
-func (rf *Raft) callAppendEntries(term int) {
+func (rf *Raft) callAppendEntries(term int64) {
 	for i := range rf.peers {
-		if i == rf.me {
+		if i == int(rf.me) {
 			continue
 		}
 		go func(peerIdx int) {
@@ -664,7 +664,7 @@ func (rf *Raft) tryToCommit() {
 
 		count := 1
 		for peer := range rf.peers {
-			if peer == rf.me {
+			if peer == int(rf.me) {
 				continue
 			}
 			if rf.matchIdx[peer] >= i {
@@ -736,7 +736,7 @@ func (rf *Raft) applier(ctx context.Context) {
 				msg = raftapi.ApplyMsg{
 					SnapshotValid: true,
 					Snapshot:      rf.persister.ReadSnapshot(),
-					SnapshotTerm:  rf.lastIncludedTerm,
+					SnapshotTerm:  int(rf.lastIncludedTerm),
 					SnapshotIndex: rf.lastIncludedIndex,
 				}
 			} else {
@@ -771,7 +771,7 @@ func (rf *Raft) applier(ctx context.Context) {
 // It handles cases where the index is part of a snapshot.
 //
 // caller must hold lock
-func (rf *Raft) getTerm(idx int) int {
+func (rf *Raft) getTerm(idx int) int64 {
 	if idx == rf.lastIncludedIndex {
 		return rf.lastIncludedTerm
 	}
@@ -788,7 +788,9 @@ func (rf *Raft) getTerm(idx int) int {
 }
 
 // lastLogIdxAndTerm returns the index and term of the last entry in the log
-func (rf *Raft) lastLogIdxAndTerm() (lastLogIdx int, lastLogTerm int) {
+//
+// caller must hold lock
+func (rf *Raft) lastLogIdxAndTerm() (lastLogIdx int, lastLogTerm int64) {
 	if len(rf.log) > 0 {
 		lastLogIdx = rf.lastIncludedIndex + len(rf.log)
 		lastLogTerm = rf.log[len(rf.log)-1].Term
@@ -802,7 +804,7 @@ func (rf *Raft) lastLogIdxAndTerm() (lastLogIdx int, lastLogTerm int) {
 // becomeFollower transitions the peer to the follower state
 //
 // caller must hold lock
-func (rf *Raft) becomeFollower(term int) {
+func (rf *Raft) becomeFollower(term int64) {
 	rf.state = follower
 	if term > rf.curTerm {
 		rf.curTerm = term
@@ -848,7 +850,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
-	rf.me = me
+	rf.me = int64(me)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rf.killCtx = ctx
