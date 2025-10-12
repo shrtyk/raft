@@ -88,10 +88,10 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.curTerm, rf.isState(leader)
 }
 
-// persist saves Raft's persistent state to stable storage
+// getPersistData encodes all non-volatile parameters and returns as slice of bytes
 //
 // caller must hold lock
-func (rf *Raft) persist() {
+func (rf *Raft) getPersistData() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
@@ -101,8 +101,20 @@ func (rf *Raft) persist() {
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
 
-	data := w.Bytes()
-	rf.persister.Save(data, rf.persister.ReadSnapshot())
+	return w.Bytes()
+}
+
+// unlockAndPersistIfNeeded unlocks the mutex and persists state if needed.
+//
+// caller must hold rf.mu.Lock()
+func (rf *Raft) unlockAndPersistIfNeeded(shouldPersist bool) {
+	if shouldPersist {
+		data := rf.getPersistData()
+		rf.mu.Unlock()
+		rf.persister.Save(data, rf.persister.ReadSnapshot())
+	} else {
+		rf.mu.Unlock()
+	}
 }
 
 // readPersist restores previously persisted state
@@ -188,22 +200,25 @@ type InstallSnapshotReply struct {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	reply.Term = rf.curTerm
 	if args.Term < rf.curTerm {
+		rf.mu.Unlock()
 		return
 	}
 
+	shouldPersist := false
 	if args.Term > rf.curTerm {
-		rf.becomeFollower(args.Term)
+		shouldPersist = rf.becomeFollower(args.Term)
 	}
 	rf.resetElectionTimer()
 
 	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+		rf.unlockAndPersistIfNeeded(shouldPersist)
 		return
 	}
 
+	shouldPersist = true
 	sliceIndex := args.LastIncludedIndex - rf.lastIncludedIndex
 	if sliceIndex < len(rf.log) && rf.getTerm(args.LastIncludedIndex) == args.LastIncludedTerm {
 		rf.log = append([]LogEntry(nil), rf.log[sliceIndex:]...)
@@ -214,20 +229,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
 
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.curTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
-	e.Encode(rf.lastIncludedIndex)
-	e.Encode(rf.lastIncludedTerm)
-	raftState := w.Bytes()
-	rf.persister.Save(raftState, args.Data)
-
 	if rf.commitIdx < args.LastIncludedIndex {
 		rf.commitIdx = args.LastIncludedIndex
 	}
 
+	raftStateData := rf.getPersistData()
+	snapshotData := args.Data
+	rf.mu.Unlock()
+
+	rf.persister.Save(raftStateData, snapshotData)
 	rf.signalCommit()
 }
 
@@ -252,18 +262,19 @@ type RequestVoteReply struct {
 // RequestVote RPC handler
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
+	shouldPersist := false
 	reply.VoteGranted = false
 	reply.VoterId = rf.me
 
 	if args.Term < rf.curTerm {
 		reply.Term = rf.curTerm
+		rf.unlockAndPersistIfNeeded(shouldPersist)
 		return
 	}
 
 	if args.Term > rf.curTerm {
-		rf.becomeFollower(args.Term)
+		shouldPersist = rf.becomeFollower(args.Term)
 	}
 
 	reply.Term = rf.curTerm
@@ -271,9 +282,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		(rf.votedFor == votedForNone || rf.votedFor == args.CandidateId) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
-		rf.persist()
+		shouldPersist = true
 		rf.resetElectionTimer()
 	}
+
+	rf.unlockAndPersistIfNeeded(shouldPersist)
 }
 
 // isCandidateLogUpToDate determines if the candidate's log is at least as up-to-date as receiver's log
@@ -316,13 +329,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term: rf.curTerm,
 		Cmd:  command,
 	})
-	rf.persist()
+	data := rf.getPersistData()
 
 	lastLogIdx, _ := rf.lastLogIdxAndTerm()
 	rf.matchIdx[rf.me] = lastLogIdx
 	rf.nextIdx[rf.me] = lastLogIdx + 1
 
 	rf.mu.Unlock()
+
+	rf.persister.Save(data, rf.persister.ReadSnapshot())
 
 	go rf.sendAppendEntries()
 
@@ -333,7 +348,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	rf.killCancel()
-	close(rf.commitChan)
 }
 
 func (rf *Raft) killed() bool {
@@ -360,17 +374,18 @@ type RequestAppendEntriesReply struct {
 // AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
+	shouldPersist := false
 	reply.Success = false
 	reply.Term = rf.curTerm
 
 	if args.Term < rf.curTerm {
+		rf.unlockAndPersistIfNeeded(shouldPersist)
 		return
 	}
 
 	if args.Term > rf.curTerm {
-		rf.becomeFollower(args.Term)
+		shouldPersist = rf.becomeFollower(args.Term)
 	}
 
 	rf.resetElectionTimer()
@@ -378,16 +393,18 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 
 	if args.PrevLogIdx < rf.lastIncludedIndex {
 		reply.Success = false
+		rf.unlockAndPersistIfNeeded(shouldPersist)
 		return
 	}
 
 	lastLogAbsIdx, _ := rf.lastLogIdxAndTerm()
 	if args.PrevLogIdx > lastLogAbsIdx || (args.PrevLogIdx >= rf.lastIncludedIndex && rf.getTerm(args.PrevLogIdx) != args.PrevLogTerm) {
 		rf.fillConflictReply(args, reply)
+		rf.unlockAndPersistIfNeeded(shouldPersist)
 		return
 	}
 
-	rf.processEntries(args)
+	shouldPersist = shouldPersist || rf.processEntries(args)
 	if args.LeaderCommitIdx > rf.commitIdx {
 		lastLogIndex, _ := rf.lastLogIdxAndTerm()
 		rf.commitIdx = min(args.LeaderCommitIdx, lastLogIndex)
@@ -395,17 +412,20 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 	}
 
 	reply.Success = true
+	rf.unlockAndPersistIfNeeded(shouldPersist)
 }
 
-// processEntries handles appending/truncating entries to the follower's log
+// processEntries handles appending/truncating entries to the follower's log.
+// It returns true if the log was modified.
 //
 // caller must hold lock
-func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) {
+func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) (logChanged bool) {
 	for i, entry := range args.Entries {
 		absIdx := args.PrevLogIdx + 1 + i
 		lastAbsIdx, _ := rf.lastLogIdxAndTerm()
 		if absIdx > lastAbsIdx {
 			rf.log = append(rf.log, args.Entries[i:]...)
+			logChanged = true
 			break
 		}
 
@@ -413,10 +433,11 @@ func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) {
 			sliceIdx := absIdx - rf.lastIncludedIndex - 1
 			rf.log = rf.log[:sliceIdx]
 			rf.log = append(rf.log, args.Entries[i:]...)
+			logChanged = true
 			break
 		}
 	}
-	rf.persist()
+	return
 }
 
 // fillConflictReply sets the conflict fields in an AppendEntries reply
@@ -444,11 +465,13 @@ func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.curTerm++
 	rf.votedFor = rf.me
-	rf.persist()
+	data := rf.getPersistData()
 	rf.resetElectionTimer()
 	lastLogIdx, lastLogTerm := rf.lastLogIdxAndTerm()
 	currentTerm := rf.curTerm
 	rf.mu.Unlock()
+
+	rf.persister.Save(data, rf.persister.ReadSnapshot())
 
 	repliesChan := make(chan *RequestVoteReply, len(rf.peers)-1)
 	args := &RequestVoteArgs{
@@ -483,9 +506,9 @@ func (rf *Raft) countVotes(timeout time.Duration, repliesChan <-chan *RequestVot
 		case reply := <-repliesChan:
 			rf.mu.Lock()
 			if reply.Term > rf.curTerm {
-				rf.becomeFollower(reply.Term)
+				shouldPersist := rf.becomeFollower(reply.Term)
 				rf.resetElectionTimer()
-				rf.mu.Unlock()
+				rf.unlockAndPersistIfNeeded(shouldPersist)
 				return
 			} else if reply.VoteGranted && rf.isState(candidate) {
 				votes[reply.VoterId] = true
@@ -553,20 +576,22 @@ func (rf *Raft) leaderSendSnapshot(peerIdx int) {
 	reply := &InstallSnapshotReply{}
 	if rf.sendInstallSnapshotRPC(peerIdx, args, reply) {
 		rf.mu.Lock()
-		defer rf.mu.Unlock()
 
 		if rf.curTerm != args.Term {
+			rf.mu.Unlock()
 			return
 		}
 
 		if reply.Term > rf.curTerm {
-			rf.becomeFollower(reply.Term)
+			shouldPersist := rf.becomeFollower(reply.Term)
 			rf.resetElectionTimer()
+			rf.unlockAndPersistIfNeeded(shouldPersist)
 			return
 		}
 
 		rf.matchIdx[peerIdx] = max(rf.matchIdx[peerIdx], args.LastIncludedIndex)
 		rf.nextIdx[peerIdx] = rf.matchIdx[peerIdx] + 1
+		rf.mu.Unlock()
 	}
 }
 
@@ -594,22 +619,23 @@ func (rf *Raft) leaderSendEntries(peerIdx int) {
 	reply := &RequestAppendEntriesReply{}
 	if rf.sendAppendEntriesRPC(peerIdx, args, reply) {
 		rf.mu.Lock()
-		defer rf.mu.Unlock()
 
 		if rf.curTerm != args.Term {
+			rf.mu.Unlock()
 			return
 		}
 
-		rf.handleAppendEntriesReply(peerIdx, args, reply)
+		shouldPersist := rf.handleAppendEntriesReply(peerIdx, args, reply)
+		rf.unlockAndPersistIfNeeded(shouldPersist)
 	}
 }
 
 // handleAppendEntriesReply processes the reply from an AppendEntries RPC
 //
 // caller must hold lock
-func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
+func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) (shouldPersist bool) {
 	if reply.Term > rf.curTerm {
-		rf.becomeFollower(reply.Term)
+		shouldPersist = rf.becomeFollower(reply.Term)
 		rf.resetElectionTimer()
 		return
 	}
@@ -651,6 +677,7 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 	} else {
 		rf.nextIdx[peerIdx] = reply.ConflictIdx
 	}
+	return
 }
 
 func (rf *Raft) tryToCommit() {
@@ -751,11 +778,13 @@ func (rf *Raft) applier(ctx context.Context) {
 				case rf.applyChan <- msg:
 				}
 
+				rf.mu.Lock()
 				if msg.SnapshotValid {
 					rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
 				} else {
 					rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.CommandIndex)
 				}
+				rf.mu.Unlock()
 			}
 		}
 	}
@@ -799,16 +828,18 @@ func (rf *Raft) isState(state State) bool {
 	return atomic.LoadUint32(&rf.state) == state
 }
 
-// becomeFollower transitions the peer to the follower state
+// becomeFollower transitions the peer to the follower state.
+// It returns true if state change requiring persistence occured.
 //
 // caller must hold lock
-func (rf *Raft) becomeFollower(term int) {
+func (rf *Raft) becomeFollower(term int) (stateChanged bool) {
 	atomic.StoreUint32(&rf.state, follower)
 	if term > rf.curTerm {
 		rf.curTerm = term
 		rf.votedFor = votedForNone
-		rf.persist()
+		stateChanged = true
 	}
+	return
 }
 
 // becomeLeader transitions the peer to the leader state
