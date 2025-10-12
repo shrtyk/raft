@@ -5,6 +5,7 @@ import (
 	"context"
 	"log"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -681,25 +682,15 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 }
 
 func (rf *Raft) tryToCommit() {
-	lastLogIdx, _ := rf.lastLogIdxAndTerm()
-	for i := rf.commitIdx + 1; i <= lastLogIdx; i++ {
-		if rf.getTerm(i) != rf.curTerm {
-			continue
-		}
+	matchIdxCopy := make([]int, len(rf.matchIdx))
+	copy(matchIdxCopy, rf.matchIdx)
 
-		count := 1
-		for peer := range rf.peers {
-			if peer == rf.me {
-				continue
-			}
-			if rf.matchIdx[peer] >= i {
-				count++
-			}
-		}
+	sort.Ints(matchIdxCopy)
+	majorityIdx := len(rf.peers) / 2
+	newCommitIdx := matchIdxCopy[majorityIdx]
 
-		if count > len(rf.peers)/2 && i > rf.commitIdx {
-			rf.commitIdx = i
-		}
+	if newCommitIdx > rf.commitIdx && rf.getTerm(newCommitIdx) == rf.curTerm {
+		rf.commitIdx = newCommitIdx
 	}
 }
 
