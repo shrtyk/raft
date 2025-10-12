@@ -747,7 +747,7 @@ func (rf *Raft) applier(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-rf.commitChan:
-			rf.mu.RLock()
+			rf.mu.Lock()
 			// Prioritize applying a snapshot if one is pending
 			if rf.lastAppliedIdx < rf.lastIncludedIndex {
 				msg := raftapi.ApplyMsg{
@@ -757,7 +757,7 @@ func (rf *Raft) applier(ctx context.Context) {
 					SnapshotIndex: rf.lastIncludedIndex,
 				}
 				rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
-				rf.mu.RUnlock()
+				rf.mu.Unlock()
 
 				rf.sendAppliedMessage(ctx, &msg)
 				continue
@@ -778,13 +778,13 @@ func (rf *Raft) applier(ctx context.Context) {
 					})
 				}
 				rf.lastAppliedIdx = end
-				rf.mu.RUnlock()
+				rf.mu.Unlock()
 
 				for _, msg := range msgs {
 					rf.sendAppliedMessage(ctx, &msg)
 				}
 			} else {
-				rf.mu.RUnlock()
+				rf.mu.Unlock()
 			}
 		}
 	}
