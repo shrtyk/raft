@@ -83,7 +83,7 @@ type LogEntry struct {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
-	return int(rf.curTerm), rf.isState(leader)
+	return rf.curTerm, rf.isState(leader)
 }
 
 // persist saves Raft's persistent state to stable storage
@@ -134,8 +134,8 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 func (rf *Raft) PersistBytes() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
 	return rf.persister.RaftStateSize()
 }
 
@@ -302,11 +302,11 @@ func (rf *Raft) sendAppendEntriesRPC(
 // Start proposes a new command to be replicated
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	isLeader := rf.isState(leader)
 	term := rf.curTerm
 	if !isLeader {
+		rf.mu.Unlock()
 		return -1, term, false
 	}
 
@@ -319,6 +319,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	lastLogIdx, _ := rf.lastLogIdxAndTerm()
 	rf.matchIdx[rf.me] = lastLogIdx
 	rf.nextIdx[rf.me] = lastLogIdx + 1
+
+	rf.mu.Unlock()
 
 	go rf.sendAppendEntries()
 
@@ -514,7 +516,7 @@ func (rf *Raft) sendAppendEntries() {
 
 	rf.resetHeartbeatTimer()
 	for i := range rf.peers {
-		if i == int(rf.me) {
+		if i == rf.me {
 			continue
 		}
 		go func(peerIdx int) {
@@ -658,7 +660,7 @@ func (rf *Raft) tryToCommit() {
 
 		count := 1
 		for peer := range rf.peers {
-			if peer == int(rf.me) {
+			if peer == rf.me {
 				continue
 			}
 			if rf.matchIdx[peer] >= i {
@@ -731,7 +733,7 @@ func (rf *Raft) applier(ctx context.Context) {
 				msg = raftapi.ApplyMsg{
 					SnapshotValid: true,
 					Snapshot:      rf.persister.ReadSnapshot(),
-					SnapshotTerm:  int(rf.lastIncludedTerm),
+					SnapshotTerm:  rf.lastIncludedTerm,
 					SnapshotIndex: rf.lastIncludedIndex,
 				}
 			} else {
