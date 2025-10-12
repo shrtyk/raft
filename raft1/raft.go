@@ -46,8 +46,8 @@ type Raft struct {
 	lastLeaderCallAt    int64 // last time got leader call (unix nano)
 	lastAppendEntriesAt int64 // last time leader sent Append Entries (unix nano)
 
-	applyChan  chan raftapi.ApplyMsg
-	commitCond *sync.Cond
+	applyChan  chan raftapi.ApplyMsg // channel for sending back applied messages to fsm
+	commitChan chan struct{}         // channel for signaling to applier goroutine
 
 	// Persistent state:
 
@@ -69,6 +69,8 @@ type Raft struct {
 
 	lastIncludedIndex int // the index of the last entry in the log that the snapshot replaces
 	lastIncludedTerm  int // the term of the last entry in the log that the snapshot replaces
+
+	// Gracefull shutdown related stuff:
 
 	killCtx    context.Context
 	killCancel func()
@@ -226,7 +228,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.commitIdx = args.LastIncludedIndex
 	}
 
-	rf.commitCond.Broadcast()
+	rf.signalCommit()
 }
 
 func (rf *Raft) sendInstallSnapshotRPC(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -331,7 +333,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	rf.killCancel()
-	rf.commitCond.Broadcast()
+	close(rf.commitChan)
 }
 
 func (rf *Raft) killed() bool {
@@ -389,7 +391,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 	if args.LeaderCommitIdx > rf.commitIdx {
 		lastLogIndex, _ := rf.lastLogIdxAndTerm()
 		rf.commitIdx = min(args.LeaderCommitIdx, lastLogIndex)
-		rf.commitCond.Broadcast()
+		rf.signalCommit()
 	}
 
 	reply.Success = true
@@ -626,7 +628,7 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 		lastCommitIdx := rf.commitIdx
 		rf.tryToCommit()
 		if rf.commitIdx != lastCommitIdx {
-			rf.commitCond.Broadcast()
+			rf.signalCommit()
 		}
 		return
 	}
@@ -675,8 +677,7 @@ func (rf *Raft) tryToCommit() {
 }
 
 func (rf *Raft) hasTimedOut(lastTimestamp, timeout int64) bool {
-	since := time.Now().UnixNano() - lastTimestamp
-	return since >= timeout
+	return time.Now().UnixNano()-lastTimestamp >= timeout
 }
 
 // ticker is the main state machine loop for a Raft peer
@@ -691,13 +692,14 @@ func (rf *Raft) ticker(ctx context.Context) {
 				timeout := randElectionIntervalMs()
 				time.Sleep(timeout)
 
-				// Probably a bit 'racy'
-				// rf.mu.Lock()
+				// Important note:
+				// We forced to use lock here since conditions check + role transition should be an atomic operation
+				rf.mu.Lock()
 				lastCall := atomic.LoadInt64(&rf.lastLeaderCallAt)
 				if !rf.killed() && rf.isState(follower) && rf.hasTimedOut(lastCall, timeout.Nanoseconds()) {
 					atomic.StoreUint32(&rf.state, candidate)
 				}
-				// rf.mu.Unlock()
+				rf.mu.Unlock()
 			case candidate:
 				rf.startElection()
 			case leader:
@@ -717,49 +719,44 @@ func (rf *Raft) applier(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-			rf.mu.Lock()
-			for rf.lastAppliedIdx >= rf.commitIdx && rf.lastAppliedIdx >= rf.lastIncludedIndex {
-				rf.commitCond.Wait()
-				if rf.killed() {
-					rf.mu.Unlock()
+		case <-rf.commitChan:
+			for {
+				var msg raftapi.ApplyMsg
+
+				rf.mu.RLock()
+				if rf.lastAppliedIdx < rf.lastIncludedIndex {
+					msg = raftapi.ApplyMsg{
+						SnapshotValid: true,
+						Snapshot:      rf.persister.ReadSnapshot(),
+						SnapshotTerm:  rf.lastIncludedTerm,
+						SnapshotIndex: rf.lastIncludedIndex,
+					}
+				} else if rf.lastAppliedIdx < rf.commitIdx {
+					applyIdx := rf.lastAppliedIdx + 1
+					sliceIdx := applyIdx - rf.lastIncludedIndex - 1
+					msg = raftapi.ApplyMsg{
+						CommandValid: true,
+						Command:      rf.log[sliceIdx].Cmd,
+						CommandIndex: applyIdx,
+					}
+				} else {
+					rf.mu.RUnlock()
+					break
+				}
+				rf.mu.RUnlock()
+
+				select {
+				case <-ctx.Done():
 					return
+				case rf.applyChan <- msg:
+				}
+
+				if msg.SnapshotValid {
+					rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
+				} else {
+					rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.CommandIndex)
 				}
 			}
-
-			var msg raftapi.ApplyMsg
-
-			if rf.lastAppliedIdx < rf.lastIncludedIndex {
-				msg = raftapi.ApplyMsg{
-					SnapshotValid: true,
-					Snapshot:      rf.persister.ReadSnapshot(),
-					SnapshotTerm:  rf.lastIncludedTerm,
-					SnapshotIndex: rf.lastIncludedIndex,
-				}
-			} else {
-				applyIdx := rf.lastAppliedIdx + 1
-				sliceIdx := applyIdx - rf.lastIncludedIndex - 1
-				msg = raftapi.ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[sliceIdx].Cmd,
-					CommandIndex: applyIdx,
-				}
-			}
-			rf.mu.Unlock()
-
-			select {
-			case <-ctx.Done():
-				return
-			case rf.applyChan <- msg:
-			}
-
-			rf.mu.Lock()
-			if msg.SnapshotValid {
-				rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
-			} else {
-				rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.CommandIndex)
-			}
-			rf.mu.Unlock()
 		}
 	}
 }
@@ -837,6 +834,14 @@ func (rf *Raft) resetHeartbeatTimer() {
 	atomic.StoreInt64(&rf.lastAppendEntriesAt, time.Now().UnixNano())
 }
 
+// signalCommit sends signal to applier goroutine
+func (rf *Raft) signalCommit() {
+	select {
+	case rf.commitChan <- struct{}{}:
+	default:
+	}
+}
+
 func randElectionIntervalMs() time.Duration {
 	return ElectionTimeoutBase + time.Duration(rand.Int63n(int64(ElectionTimeoutRand)))
 }
@@ -852,7 +857,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	ctx, cancel := context.WithCancel(context.Background())
 	rf.killCtx = ctx
 	rf.killCancel = cancel
-	rf.commitCond = sync.NewCond(&rf.mu)
+	rf.commitChan = make(chan struct{}, 1)
 
 	atomic.StoreUint32(&rf.state, follower)
 	rf.log = make([]LogEntry, 0)
