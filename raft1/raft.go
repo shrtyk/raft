@@ -740,6 +740,15 @@ func (rf *Raft) ticker(ctx context.Context) {
 	}
 }
 
+// sendAppliedMessage helper function to send msg into applyChan
+func (rf *Raft) sendAppliedMessage(ctx context.Context, msg *raftapi.ApplyMsg) {
+	select {
+	case <-ctx.Done():
+		return
+	case rf.applyChan <- *msg:
+	}
+}
+
 // applies committed log entries to the state machine in the background
 func (rf *Raft) applier(ctx context.Context) {
 	for {
@@ -747,44 +756,44 @@ func (rf *Raft) applier(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-rf.commitChan:
-			for {
-				var msg raftapi.ApplyMsg
-
-				rf.mu.RLock()
-				if rf.lastAppliedIdx < rf.lastIncludedIndex {
-					msg = raftapi.ApplyMsg{
-						SnapshotValid: true,
-						Snapshot:      rf.persister.ReadSnapshot(),
-						SnapshotTerm:  rf.lastIncludedTerm,
-						SnapshotIndex: rf.lastIncludedIndex,
-					}
-				} else if rf.lastAppliedIdx < rf.commitIdx {
-					applyIdx := rf.lastAppliedIdx + 1
-					sliceIdx := applyIdx - rf.lastIncludedIndex - 1
-					msg = raftapi.ApplyMsg{
-						CommandValid: true,
-						Command:      rf.log[sliceIdx].Cmd,
-						CommandIndex: applyIdx,
-					}
-				} else {
-					rf.mu.RUnlock()
-					break
+			rf.mu.RLock()
+			// Prioritize applying a snapshot if one is pending
+			if rf.lastAppliedIdx < rf.lastIncludedIndex {
+				msg := raftapi.ApplyMsg{
+					SnapshotValid: true,
+					Snapshot:      rf.persister.ReadSnapshot(),
+					SnapshotTerm:  rf.lastIncludedTerm,
+					SnapshotIndex: rf.lastIncludedIndex,
 				}
+				rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
 				rf.mu.RUnlock()
 
-				select {
-				case <-ctx.Done():
-					return
-				case rf.applyChan <- msg:
-				}
+				rf.sendAppliedMessage(ctx, &msg)
+				continue
+			}
 
-				rf.mu.Lock()
-				if msg.SnapshotValid {
-					rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
-				} else {
-					rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.CommandIndex)
+			// Batch apply committed log entries
+			if rf.lastAppliedIdx < rf.commitIdx {
+				start := rf.lastAppliedIdx + 1
+				end := rf.commitIdx
+
+				msgs := make([]raftapi.ApplyMsg, 0, end-start+1)
+				for i := start; i <= end; i++ {
+					sliceIdx := i - rf.lastIncludedIndex - 1
+					msgs = append(msgs, raftapi.ApplyMsg{
+						CommandValid: true,
+						Command:      rf.log[sliceIdx].Cmd,
+						CommandIndex: i,
+					})
 				}
-				rf.mu.Unlock()
+				rf.lastAppliedIdx = end
+				rf.mu.RUnlock()
+
+				for _, msg := range msgs {
+					rf.sendAppliedMessage(ctx, &msg)
+				}
+			} else {
+				rf.mu.RUnlock()
 			}
 		}
 	}
