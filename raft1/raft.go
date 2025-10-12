@@ -39,20 +39,20 @@ type Raft struct {
 	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *tester.Persister   // Object to hold this peer's persisted state
-	me        int64               // this peer's index into peers[]
+	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
 	state               State
-	lastLeaderCallAt    time.Time // last time got leader call
-	lastAppendEntriesAt time.Time // last time leader sent Append Entries
+	lastLeaderCallAt    int64 // last time got leader call (unix nano)
+	lastAppendEntriesAt int64 // last time leader sent Append Entries (unix nano)
 
 	applyChan  chan raftapi.ApplyMsg
 	commitCond *sync.Cond
 
 	// Persistent state:
 
-	curTerm  int64      // latest term server has seen
-	votedFor int64      // index of peer in peers
+	curTerm  int        // latest term server has seen
+	votedFor int        // index of peer in peers
 	log      []LogEntry // log entries
 
 	// Volatile state on all servers:
@@ -67,23 +67,23 @@ type Raft struct {
 	// for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 	matchIdx []int
 
-	lastIncludedIndex int   // the index of the last entry in the log that the snapshot replaces
-	lastIncludedTerm  int64 // the term of the last entry in the log that the snapshot replaces
+	lastIncludedIndex int // the index of the last entry in the log that the snapshot replaces
+	lastIncludedTerm  int // the term of the last entry in the log that the snapshot replaces
 
 	killCtx    context.Context
 	killCancel func()
 }
 
 type LogEntry struct {
-	Term int64 // term when entry was received
-	Cmd  any   // command for state machine
+	Term int // term when entry was received
+	Cmd  any // command for state machine
 }
 
 // GetState returns current term and whether this server believes it is the leader
 func (rf *Raft) GetState() (int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return int(rf.curTerm), rf.state == leader
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	return int(rf.curTerm), rf.isState(leader)
 }
 
 // persist saves Raft's persistent state to stable storage
@@ -114,8 +114,7 @@ func (rf *Raft) readPersist(data []byte) {
 	b := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(b)
 
-	var term, lastIncludedTerm, votedFor int64
-	var lastIncludedIndex int
+	var term, lastIncludedTerm, votedFor, lastIncludedIndex int
 	var l []LogEntry
 
 	if d.Decode(&term) != nil || d.Decode(&votedFor) != nil ||
@@ -174,15 +173,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 type InstallSnapshotArgs struct {
-	Term              int64
-	LeaderId          int64
+	Term              int
+	LeaderId          int
 	LastIncludedIndex int
-	LastIncludedTerm  int64
+	LastIncludedTerm  int
 	Data              []byte
 }
 
 type InstallSnapshotReply struct {
-	Term int64
+	Term int
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
@@ -236,16 +235,16 @@ func (rf *Raft) sendInstallSnapshotRPC(server int, args *InstallSnapshotArgs, re
 }
 
 type RequestVoteArgs struct {
-	Term        int64 // candidate’s term
-	CandidateId int64 // candidate requesting vote
-	LastLogIdx  int   // index of candidate’s last log entry
-	LastLogTerm int64 // term of candidate’s last log entry
+	Term        int // candidate’s term
+	CandidateId int // candidate requesting vote
+	LastLogIdx  int // index of candidate’s last log entry
+	LastLogTerm int // term of candidate’s last log entry
 }
 
 type RequestVoteReply struct {
-	Term        int64
+	Term        int
 	VoteGranted bool
-	VoterId     int64
+	VoterId     int
 }
 
 // RequestVote RPC handler
@@ -278,7 +277,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // isCandidateLogUpToDate determines if the candidate's log is at least as up-to-date as receiver's log
 //
 // caller must hold lock
-func (rf *Raft) isCandidateLogUpToDate(candidateLastLogIdx int, candidateLastLogTerm int64) bool {
+func (rf *Raft) isCandidateLogUpToDate(candidateLastLogIdx int, candidateLastLogTerm int) bool {
 	myLastLogIdx, myLastLogTerm := rf.lastLogIdxAndTerm()
 	if candidateLastLogTerm != myLastLogTerm {
 		return candidateLastLogTerm > myLastLogTerm
@@ -305,10 +304,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	isLeader := rf.state == leader
+	isLeader := rf.isState(leader)
 	term := rf.curTerm
 	if !isLeader {
-		return -1, int(term), false
+		return -1, term, false
 	}
 
 	rf.log = append(rf.log, LogEntry{
@@ -323,7 +322,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	go rf.sendAppendEntries()
 
-	return lastLogIdx, int(term), isLeader
+	return lastLogIdx, term, isLeader
 }
 
 // Kill sets the peer to a dead state
@@ -334,25 +333,24 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead)
-	return z == 1
+	return atomic.LoadInt32(&rf.dead) == 1
 }
 
 type RequestAppendEntriesArgs struct {
-	Term            int64      // leader term
-	LeaderId        int64      // for riderection
-	PrevLogTerm     int64      // term of prevLogIdx entry
+	Term            int        // leader term
+	LeaderId        int        // for riderection
+	PrevLogTerm     int        // term of prevLogIdx entry
 	PrevLogIdx      int        // index of log entry immidiately preceding new ones
 	LeaderCommitIdx int        // leader's commit index
 	Entries         []LogEntry // log entries to store (empty for heartbeat)
 }
 
 type RequestAppendEntriesReply struct {
-	Term    int64 // current term for leader to update itself
-	Success bool  // true if follower contained entry matching prevLogIdx and prevLogTerm
+	Term    int  // current term for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIdx and prevLogTerm
 
 	ConflictIdx  int
-	ConflictTerm int64
+	ConflictTerm int
 }
 
 // AppendEntries RPC handler
@@ -485,7 +483,7 @@ func (rf *Raft) countVotes(timeout time.Duration, repliesChan <-chan *RequestVot
 				rf.resetElectionTimer()
 				rf.mu.Unlock()
 				return
-			} else if reply.VoteGranted && rf.state == candidate {
+			} else if reply.VoteGranted && rf.isState(candidate) {
 				votes[reply.VoterId] = true
 				if rf.isEnoughVotes(votes) {
 					rf.becomeLeader()
@@ -510,23 +508,19 @@ func (rf *Raft) isEnoughVotes(votes []bool) bool {
 }
 
 func (rf *Raft) sendAppendEntries() {
-	rf.mu.Lock()
-	rf.resetHeartbeatTimer()
+	rf.mu.RLock()
 	curTerm := rf.curTerm
-	rf.mu.Unlock()
+	rf.mu.RUnlock()
 
-	rf.callAppendEntries(curTerm)
-}
-
-func (rf *Raft) callAppendEntries(term int64) {
+	rf.resetHeartbeatTimer()
 	for i := range rf.peers {
 		if i == int(rf.me) {
 			continue
 		}
 		go func(peerIdx int) {
-			rf.mu.Lock()
-			if rf.curTerm != term || rf.state != leader {
-				rf.mu.Unlock()
+			rf.mu.RLock()
+			if rf.curTerm != curTerm || !rf.isState(leader) {
+				rf.mu.RUnlock()
 				return
 			}
 
@@ -550,7 +544,7 @@ func (rf *Raft) leaderSendSnapshot(peerIdx int) {
 		LastIncludedTerm:  rf.lastIncludedTerm,
 		Data:              rf.persister.ReadSnapshot(),
 	}
-	rf.mu.Unlock()
+	rf.mu.RUnlock()
 
 	reply := &InstallSnapshotReply{}
 	if rf.sendInstallSnapshotRPC(peerIdx, args, reply) {
@@ -591,7 +585,7 @@ func (rf *Raft) leaderSendEntries(peerIdx int) {
 		LeaderCommitIdx: rf.commitIdx,
 		Entries:         entries,
 	}
-	rf.mu.Unlock()
+	rf.mu.RUnlock()
 
 	reply := &RequestAppendEntriesReply{}
 	if rf.sendAppendEntriesRPC(peerIdx, args, reply) {
@@ -616,7 +610,7 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 		return
 	}
 
-	if rf.state != leader || args.Term != rf.curTerm {
+	if !rf.isState(leader) || args.Term != rf.curTerm {
 		return
 	}
 
@@ -678,6 +672,11 @@ func (rf *Raft) tryToCommit() {
 	}
 }
 
+func (rf *Raft) hasTimedOut(lastTimestamp, timeout int64) bool {
+	since := time.Now().UnixNano() - lastTimestamp
+	return since >= timeout
+}
+
 // ticker is the main state machine loop for a Raft peer
 func (rf *Raft) ticker(ctx context.Context) {
 	for {
@@ -685,29 +684,25 @@ func (rf *Raft) ticker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			rf.mu.Lock()
-			state := rf.state
-			rf.mu.Unlock()
-			switch state {
+			switch atomic.LoadUint32(&rf.state) {
 			case follower:
 				timeout := randElectionIntervalMs()
 				time.Sleep(timeout)
 
-				rf.mu.Lock()
-				if !rf.killed() && rf.state == follower && time.Since(rf.lastLeaderCallAt) >= timeout {
-					rf.state = candidate
+				// Probably a bit 'racy'
+				// rf.mu.Lock()
+				lastCall := atomic.LoadInt64(&rf.lastLeaderCallAt)
+				if !rf.killed() && rf.isState(follower) && rf.hasTimedOut(lastCall, timeout.Nanoseconds()) {
+					atomic.StoreUint32(&rf.state, candidate)
 				}
-				rf.mu.Unlock()
+				// rf.mu.Unlock()
 			case candidate:
 				rf.startElection()
 			case leader:
 				time.Sleep(HeartbeatInterval)
-				rf.mu.Lock()
-				if !rf.killed() && time.Since(rf.lastAppendEntriesAt) >= HeartbeatInterval {
-					rf.mu.Unlock()
+				lastBeat := atomic.LoadInt64(&rf.lastAppendEntriesAt)
+				if !rf.killed() && rf.hasTimedOut(lastBeat, HeartbeatInterval.Nanoseconds()) {
 					rf.sendAppendEntries()
-				} else {
-					rf.mu.Unlock()
 				}
 			}
 		}
@@ -771,7 +766,7 @@ func (rf *Raft) applier(ctx context.Context) {
 // It handles cases where the index is part of a snapshot.
 //
 // caller must hold lock
-func (rf *Raft) getTerm(idx int) int64 {
+func (rf *Raft) getTerm(idx int) int {
 	if idx == rf.lastIncludedIndex {
 		return rf.lastIncludedTerm
 	}
@@ -790,7 +785,7 @@ func (rf *Raft) getTerm(idx int) int64 {
 // lastLogIdxAndTerm returns the index and term of the last entry in the log
 //
 // caller must hold lock
-func (rf *Raft) lastLogIdxAndTerm() (lastLogIdx int, lastLogTerm int64) {
+func (rf *Raft) lastLogIdxAndTerm() (lastLogIdx, lastLogTerm int) {
 	if len(rf.log) > 0 {
 		lastLogIdx = rf.lastIncludedIndex + len(rf.log)
 		lastLogTerm = rf.log[len(rf.log)-1].Term
@@ -801,11 +796,15 @@ func (rf *Raft) lastLogIdxAndTerm() (lastLogIdx int, lastLogTerm int64) {
 	return
 }
 
+func (rf *Raft) isState(state State) bool {
+	return atomic.LoadUint32(&rf.state) == state
+}
+
 // becomeFollower transitions the peer to the follower state
 //
 // caller must hold lock
-func (rf *Raft) becomeFollower(term int64) {
-	rf.state = follower
+func (rf *Raft) becomeFollower(term int) {
+	atomic.StoreUint32(&rf.state, follower)
 	if term > rf.curTerm {
 		rf.curTerm = term
 		rf.votedFor = votedForNone
@@ -817,7 +816,7 @@ func (rf *Raft) becomeFollower(term int64) {
 //
 // caller must hold lock
 func (rf *Raft) becomeLeader() {
-	rf.state = leader
+	atomic.StoreUint32(&rf.state, leader)
 	lastLogIdx, _ := rf.lastLogIdxAndTerm()
 	for i := range rf.peers {
 		rf.nextIdx[i] = lastLogIdx + 1
@@ -827,17 +826,13 @@ func (rf *Raft) becomeLeader() {
 }
 
 // resetElectionTimer resets the election timer
-//
-// caller must hold lock
 func (rf *Raft) resetElectionTimer() {
-	rf.lastLeaderCallAt = time.Now()
+	atomic.StoreInt64(&rf.lastLeaderCallAt, time.Now().UnixNano())
 }
 
 // resetHeartbeatTimer resets the heartbeat timer
-//
-// caller must hold lock
 func (rf *Raft) resetHeartbeatTimer() {
-	rf.lastAppendEntriesAt = time.Now()
+	atomic.StoreInt64(&rf.lastAppendEntriesAt, time.Now().UnixNano())
 }
 
 func randElectionIntervalMs() time.Duration {
@@ -850,15 +845,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
-	rf.me = int64(me)
+	rf.me = me
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rf.killCtx = ctx
 	rf.killCancel = cancel
 	rf.commitCond = sync.NewCond(&rf.mu)
 
-	rf.state = follower
-	rf.lastLeaderCallAt = time.Now()
+	atomic.StoreUint32(&rf.state, follower)
 	rf.log = make([]LogEntry, 0)
 	rf.applyChan = applyCh
 
@@ -871,6 +865,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	rf.matchIdx = make([]int, len(peers))
 
+	rf.resetElectionTimer()
 	go rf.applier(ctx)
 	go rf.ticker(ctx)
 
