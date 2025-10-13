@@ -50,6 +50,8 @@ type Raft struct {
 	applyChan  chan raftapi.ApplyMsg // channel for sending back applied messages to fsm
 	commitChan chan struct{}         // channel for signaling to applier goroutine
 
+	persisterMu sync.RWMutex
+
 	// Persistent state:
 
 	curTerm  int        // latest term server has seen
@@ -91,7 +93,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 // getPersistData encodes all non-volatile parameters and returns as slice of bytes
 //
-// caller must hold lock
+// Assumes the lock is held when called
 func (rf *Raft) getPersistData() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -107,20 +109,41 @@ func (rf *Raft) getPersistData() []byte {
 
 // unlockAndPersistIfNeeded unlocks the mutex and persists state if needed.
 //
-// caller must hold rf.mu.Lock()
+// Assumes the lock is held when called
 func (rf *Raft) unlockAndPersistIfNeeded(shouldPersist bool) {
 	if shouldPersist {
 		data := rf.getPersistData()
 		rf.mu.Unlock()
-		rf.persister.Save(data, rf.persister.ReadSnapshot())
+		rf.persistStateOnly(data)
 	} else {
 		rf.mu.Unlock()
 	}
 }
 
+// readSnapshot reads the snapshot safely
+func (rf *Raft) readSnapshot() []byte {
+	rf.persisterMu.Lock()
+	defer rf.persisterMu.Unlock()
+	return rf.persister.ReadSnapshot()
+}
+
+// persistStateAndSnapshot saves state and snapshot safely
+func (rf *Raft) persistStateAndSnapshot(raftState []byte, snapshot []byte) {
+	rf.persisterMu.Lock()
+	defer rf.persisterMu.Unlock()
+	rf.persister.Save(raftState, snapshot)
+}
+
+// persistStateOnly saves raft state only, leaving snapshot unchanged
+func (rf *Raft) persistStateOnly(raftState []byte) {
+	rf.persisterMu.Lock()
+	defer rf.persisterMu.Unlock()
+	rf.persister.Save(raftState, rf.persister.ReadSnapshot())
+}
+
 // readPersist restores previously persisted state
 //
-// caller must hold lock
+// Assumes the lock is held when called
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -149,23 +172,20 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 func (rf *Raft) PersistBytes() int {
-	rf.mu.RLock()
-	defer rf.mu.RUnlock()
+	rf.persisterMu.RLock()
+	defer rf.persisterMu.RUnlock()
 	return rf.persister.RaftStateSize()
 }
 
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	if index <= rf.lastIncludedIndex {
+		rf.mu.Unlock()
 		return
 	}
 
-	// Determine the term of the snapshot point
 	term := rf.getTerm(index)
-
-	// Cut the log to keep entries after index
 	sliceIndex := index - rf.lastIncludedIndex
 	if sliceIndex < len(rf.log) {
 		rf.log = append([]LogEntry(nil), rf.log[sliceIndex:]...)
@@ -176,15 +196,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.lastIncludedIndex = index
 	rf.lastIncludedTerm = term
 
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.curTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
-	e.Encode(rf.lastIncludedIndex)
-	e.Encode(rf.lastIncludedTerm)
-	data := w.Bytes()
-	rf.persister.Save(data, snapshot)
+	data := rf.getPersistData()
+	rf.mu.Unlock()
+
+	rf.persistStateAndSnapshot(data, snapshot)
 }
 
 type InstallSnapshotArgs struct {
@@ -238,7 +253,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	snapshotData := args.Data
 	rf.mu.Unlock()
 
-	rf.persister.Save(raftStateData, snapshotData)
+	rf.persistStateAndSnapshot(raftStateData, snapshotData)
 	rf.signalCommit()
 }
 
@@ -292,7 +307,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 // isCandidateLogUpToDate determines if the candidate's log is at least as up-to-date as receiver's log
 //
-// caller must hold lock
+// Assumes the lock is held when called
 func (rf *Raft) isCandidateLogUpToDate(candidateLastLogIdx int, candidateLastLogTerm int) bool {
 	myLastLogIdx, myLastLogTerm := rf.lastLogIdxAndTerm()
 	if candidateLastLogTerm != myLastLogTerm {
@@ -338,9 +353,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.mu.Unlock()
 
-	rf.persister.Save(data, rf.persister.ReadSnapshot())
-
-	go rf.sendAppendEntries()
+	rf.persistStateOnly(data)
 
 	return lastLogIdx, term, isLeader
 }
@@ -419,7 +432,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 // processEntries handles appending/truncating entries to the follower's log.
 // It returns true if the log was modified.
 //
-// caller must hold lock
+// Assumes the lock is held when called
 func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) (logChanged bool) {
 	for i, entry := range args.Entries {
 		absIdx := args.PrevLogIdx + 1 + i
@@ -443,7 +456,7 @@ func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) (logChanged bool)
 
 // fillConflictReply sets the conflict fields in an AppendEntries reply
 //
-// caller must hold lock
+// Assumes the lock is held when called
 func (rf *Raft) fillConflictReply(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	lastLogIdx, _ := rf.lastLogIdxAndTerm()
 	if args.PrevLogIdx > lastLogIdx {
@@ -565,14 +578,20 @@ func (rf *Raft) sendAppendEntries() {
 //
 // Assumes the lock is held when called
 func (rf *Raft) leaderSendSnapshot(peerIdx int) {
-	args := &InstallSnapshotArgs{
-		Term:              rf.curTerm,
-		LeaderId:          rf.me,
-		LastIncludedIndex: rf.lastIncludedIndex,
-		LastIncludedTerm:  rf.lastIncludedTerm,
-		Data:              rf.persister.ReadSnapshot(),
-	}
+	term := rf.curTerm
+	leaderId := rf.me
+	lastIncludedIndex := rf.lastIncludedIndex
+	lastIncludedTerm := rf.lastIncludedTerm
 	rf.mu.RUnlock()
+
+	snapshotData := rf.readSnapshot()
+	args := &InstallSnapshotArgs{
+		Term:              term,
+		LeaderId:          leaderId,
+		LastIncludedIndex: lastIncludedIndex,
+		LastIncludedTerm:  lastIncludedTerm,
+		Data:              snapshotData,
+	}
 
 	reply := &InstallSnapshotReply{}
 	if rf.sendInstallSnapshotRPC(peerIdx, args, reply) {
@@ -633,7 +652,7 @@ func (rf *Raft) leaderSendEntries(peerIdx int) {
 
 // handleAppendEntriesReply processes the reply from an AppendEntries RPC
 //
-// caller must hold lock
+// Assumes the lock is held when called
 func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) (shouldPersist bool) {
 	if reply.Term > rf.curTerm {
 		shouldPersist = rf.becomeFollower(reply.Term)
@@ -747,43 +766,39 @@ func (rf *Raft) applier(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-rf.commitChan:
-			rf.mu.Lock()
-			// Prioritize applying a snapshot if one is pending
-			if rf.lastAppliedIdx < rf.lastIncludedIndex {
-				msg := raftapi.ApplyMsg{
-					SnapshotValid: true,
-					Snapshot:      rf.persister.ReadSnapshot(),
-					SnapshotTerm:  rf.lastIncludedTerm,
-					SnapshotIndex: rf.lastIncludedIndex,
-				}
-				rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
-				rf.mu.Unlock()
+			for {
+				var msg raftapi.ApplyMsg
+				rf.mu.RLock()
 
-				rf.sendAppliedMessage(ctx, &msg)
-				continue
-			}
-
-			// Batch apply committed log entries
-			if rf.lastAppliedIdx < rf.commitIdx {
-				start := rf.lastAppliedIdx + 1
-				end := rf.commitIdx
-
-				msgs := make([]raftapi.ApplyMsg, 0, end-start+1)
-				for i := start; i <= end; i++ {
-					sliceIdx := i - rf.lastIncludedIndex - 1
-					msgs = append(msgs, raftapi.ApplyMsg{
+				if rf.lastAppliedIdx < rf.lastIncludedIndex {
+					msg = raftapi.ApplyMsg{
+						SnapshotValid: true,
+						Snapshot:      rf.readSnapshot(),
+						SnapshotTerm:  rf.lastIncludedTerm,
+						SnapshotIndex: rf.lastIncludedIndex,
+					}
+				} else if rf.lastAppliedIdx < rf.commitIdx {
+					applyIdx := rf.lastAppliedIdx + 1
+					sliceIdx := applyIdx - rf.lastIncludedIndex - 1
+					msg = raftapi.ApplyMsg{
 						CommandValid: true,
 						Command:      rf.log[sliceIdx].Cmd,
-						CommandIndex: i,
-					})
+						CommandIndex: applyIdx,
+					}
+				} else {
+					rf.mu.RUnlock()
+					break
 				}
-				rf.lastAppliedIdx = end
-				rf.mu.Unlock()
+				rf.mu.RUnlock()
 
-				for _, msg := range msgs {
-					rf.sendAppliedMessage(ctx, &msg)
+				rf.sendAppliedMessage(ctx, &msg)
+
+				rf.mu.Lock()
+				if msg.SnapshotValid {
+					rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
+				} else {
+					rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.CommandIndex)
 				}
-			} else {
 				rf.mu.Unlock()
 			}
 		}
@@ -793,7 +808,7 @@ func (rf *Raft) applier(ctx context.Context) {
 // getTerm returns the term of a log entry at a given absolute index.
 // It handles cases where the index is part of a snapshot.
 //
-// caller must hold lock
+// Assumes the lock is held when called
 func (rf *Raft) getTerm(idx int) int {
 	if idx == rf.lastIncludedIndex {
 		return rf.lastIncludedTerm
@@ -831,7 +846,7 @@ func (rf *Raft) isState(state State) bool {
 // becomeFollower transitions the peer to the follower state.
 // It returns true if state change requiring persistence occured.
 //
-// caller must hold lock
+// Assumes the lock is held when called
 func (rf *Raft) becomeFollower(term int) (stateChanged bool) {
 	atomic.StoreUint32(&rf.state, follower)
 	if term > rf.curTerm {
@@ -877,7 +892,6 @@ func randElectionIntervalMs() time.Duration {
 	return ElectionTimeoutBase + time.Duration(rand.Int63n(int64(ElectionTimeoutRand)))
 }
 
-// Make creates and starts a new Raft peer
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{}
