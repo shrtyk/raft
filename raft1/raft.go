@@ -37,15 +37,19 @@ const (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
+	wg        sync.WaitGroup
 	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *tester.Persister   // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	state               State
-	lastLeaderCallAt    int64 // last time got leader call (unix nano)
-	lastAppendEntriesAt int64 // last time leader sent Append Entries (unix nano)
+	state State
+
+	// Timers
+	timerMu         sync.Mutex
+	electionTimer   *time.Timer
+	heartbeatTicker *time.Ticker
 
 	applyChan  chan raftapi.ApplyMsg
 	commitCond *sync.Cond
@@ -330,6 +334,7 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	rf.killCancel()
 	rf.commitCond.Broadcast()
+	rf.wg.Wait()
 }
 
 func (rf *Raft) killed() bool {
@@ -512,7 +517,6 @@ func (rf *Raft) sendAppendEntries() {
 	curTerm := rf.curTerm
 	rf.mu.RUnlock()
 
-	rf.resetHeartbeatTimer()
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -662,49 +666,34 @@ func (rf *Raft) tryToCommit() {
 	}
 }
 
-func (rf *Raft) hasTimedOut(lastTimestamp, timeout int64) bool {
-	since := time.Now().UnixNano() - lastTimestamp
-	return since >= timeout
-}
-
 // ticker is the main state machine loop for a Raft peer
-func (rf *Raft) ticker(ctx context.Context) {
+func (rf *Raft) ticker() {
+	defer rf.wg.Done()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-rf.killCtx.Done():
 			return
-		default:
-			switch atomic.LoadUint32(&rf.state) {
-			case follower:
-				timeout := randElectionIntervalMs()
-				time.Sleep(timeout)
-
-				// Important note:
-				// We forced to use lock here since conditions check + role transition should be an atomic operation
-				rf.mu.Lock()
-				lastCall := atomic.LoadInt64(&rf.lastLeaderCallAt)
-				if !rf.killed() && rf.isState(follower) && rf.hasTimedOut(lastCall, timeout.Nanoseconds()) {
-					atomic.StoreUint32(&rf.state, candidate)
-				}
-				rf.mu.Unlock()
-			case candidate:
-				rf.startElection()
-			case leader:
-				time.Sleep(HeartbeatInterval)
-				lastBeat := atomic.LoadInt64(&rf.lastAppendEntriesAt)
-				if !rf.killed() && rf.hasTimedOut(lastBeat, HeartbeatInterval.Nanoseconds()) {
-					rf.sendAppendEntries()
-				}
+		case <-rf.electionTimer.C:
+			rf.mu.Lock()
+			if !rf.isState(leader) {
+				atomic.StoreUint32(&rf.state, candidate)
+				go rf.startElection()
+			}
+			rf.mu.Unlock()
+		case <-rf.heartbeatTicker.C:
+			if rf.isState(leader) {
+				rf.sendAppendEntries()
 			}
 		}
 	}
 }
 
 // applies committed log entries to the state machine in the background
-func (rf *Raft) applier(ctx context.Context) {
+func (rf *Raft) applier() {
+	defer rf.wg.Done()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-rf.killCtx.Done():
 			return
 		default:
 			rf.mu.Lock()
@@ -737,7 +726,7 @@ func (rf *Raft) applier(ctx context.Context) {
 			rf.mu.Unlock()
 
 			select {
-			case <-ctx.Done():
+			case <-rf.killCtx.Done():
 				return
 			case rf.applyChan <- msg:
 			}
@@ -801,6 +790,7 @@ func (rf *Raft) becomeFollower(term int) {
 		rf.votedFor = votedForNone
 		rf.persist()
 	}
+	rf.resetElectionTimer()
 }
 
 // becomeLeader transitions the peer to the leader state
@@ -808,6 +798,8 @@ func (rf *Raft) becomeFollower(term int) {
 // Assumes the lock is held when called
 func (rf *Raft) becomeLeader() {
 	atomic.StoreUint32(&rf.state, leader)
+	rf.resetHeartbeatTicker()
+
 	lastLogIdx, _ := rf.lastLogIdxAndTerm()
 	for i := range rf.peers {
 		rf.nextIdx[i] = lastLogIdx + 1
@@ -816,14 +808,31 @@ func (rf *Raft) becomeLeader() {
 	rf.matchIdx[rf.me] = lastLogIdx
 }
 
-// resetElectionTimer resets the election timer
-func (rf *Raft) resetElectionTimer() {
-	atomic.StoreInt64(&rf.lastLeaderCallAt, time.Now().UnixNano())
+// activateLeaderTimers stops election timer and starts heartbeat ticker
+func (rf *Raft) resetHeartbeatTicker() {
+	rf.timerMu.Lock()
+	defer rf.timerMu.Unlock()
+	if !rf.electionTimer.Stop() {
+		select {
+		case <-rf.electionTimer.C:
+		default:
+		}
+	}
+	rf.heartbeatTicker.Reset(HeartbeatInterval)
 }
 
-// resetHeartbeatTimer resets the heartbeat timer
-func (rf *Raft) resetHeartbeatTimer() {
-	atomic.StoreInt64(&rf.lastAppendEntriesAt, time.Now().UnixNano())
+// resetElectionTimer stops heartbeat ticker and resets election timer
+func (rf *Raft) resetElectionTimer() {
+	rf.timerMu.Lock()
+	defer rf.timerMu.Unlock()
+	rf.heartbeatTicker.Stop()
+	if !rf.electionTimer.Stop() {
+		select {
+		case <-rf.electionTimer.C:
+		default:
+		}
+	}
+	rf.electionTimer.Reset(randElectionIntervalMs())
 }
 
 func randElectionIntervalMs() time.Duration {
@@ -847,6 +856,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = make([]LogEntry, 0)
 	rf.applyChan = applyCh
 
+	rf.electionTimer = time.NewTimer(randElectionIntervalMs())
+	rf.heartbeatTicker = time.NewTicker(HeartbeatInterval)
+	rf.heartbeatTicker.Stop()
+
 	rf.readPersist(persister.ReadRaftState())
 
 	lastLogIdx, _ := rf.lastLogIdxAndTerm()
@@ -856,9 +869,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	rf.matchIdx = make([]int, len(peers))
 
-	rf.resetElectionTimer()
-	go rf.applier(ctx)
-	go rf.ticker(ctx)
+	rf.wg.Add(2)
+	go rf.applier()
+	go rf.ticker()
 
 	return rf
 }
