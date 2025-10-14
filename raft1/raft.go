@@ -91,10 +91,10 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.curTerm, rf.isState(leader)
 }
 
-// persist saves Raft's persistent state to stable storage
+// getPersistentStateBytes helper function for getting bytes of persistent state
 //
 // Assumes the lock is held when called
-func (rf *Raft) persist() {
+func (rf *Raft) getPersistentStateBytes() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
@@ -104,7 +104,14 @@ func (rf *Raft) persist() {
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
 
-	data := w.Bytes()
+	return w.Bytes()
+}
+
+// persist saves Raft's persistent state to stable storage
+//
+// Assumes the lock is held when called
+func (rf *Raft) persist() {
+	data := rf.getPersistentStateBytes()
 	rf.persister.Save(data, rf.persister.ReadSnapshot())
 }
 
@@ -163,14 +170,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.lastIncludedIndex = index
 	rf.lastIncludedTerm = term
 
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.curTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
-	e.Encode(rf.lastIncludedIndex)
-	e.Encode(rf.lastIncludedTerm)
-	data := w.Bytes()
+	data := rf.getPersistentStateBytes()
 	rf.persister.Save(data, snapshot)
 }
 
@@ -214,14 +214,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
 
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.curTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
-	e.Encode(rf.lastIncludedIndex)
-	e.Encode(rf.lastIncludedTerm)
-	raftState := w.Bytes()
+	raftState := rf.getPersistentStateBytes()
 	rf.persister.Save(raftState, args.Data)
 
 	if rf.commitIdx < args.LastIncludedIndex {
