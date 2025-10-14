@@ -691,18 +691,21 @@ func (rf *Raft) ticker() {
 // applies committed log entries to the state machine in the background
 func (rf *Raft) applier() {
 	defer rf.wg.Done()
+	defer close(rf.applyChan)
+
 	for {
 		select {
 		case <-rf.killCtx.Done():
 			return
 		default:
 			rf.mu.Lock()
-			for rf.lastAppliedIdx >= rf.commitIdx && rf.lastAppliedIdx >= rf.lastIncludedIndex {
+			for rf.lastAppliedIdx >= rf.commitIdx && rf.lastAppliedIdx >= rf.lastIncludedIndex && !rf.killed() {
 				rf.commitCond.Wait()
-				if rf.killed() {
-					rf.mu.Unlock()
-					return
-				}
+			}
+
+			if rf.killed() {
+				rf.mu.Unlock()
+				return
 			}
 
 			var msg raftapi.ApplyMsg

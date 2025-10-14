@@ -9,8 +9,7 @@ import (
 	"github.com/shrtyk/raft/labgob"
 	"github.com/shrtyk/raft/labrpc"
 	"github.com/shrtyk/raft/raftapi"
-	"github.com/shrtyk/raft/tester1"
-
+	tester "github.com/shrtyk/raft/tester1"
 )
 
 const (
@@ -18,7 +17,6 @@ const (
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
-
 
 type rfsrv struct {
 	ts          *Test
@@ -152,7 +150,12 @@ func (rs *rfsrv) applierSnap(applyCh chan raftapi.ApplyMsg) {
 				}
 				e.Encode(xlog)
 				start := tester.GetAnnotateTimestamp()
-				rs.raft.Snapshot(m.CommandIndex, w.Bytes())
+
+				raft := rs.Raft()
+				if raft != nil {
+					raft.Snapshot(m.CommandIndex, w.Bytes())
+				}
+
 				details := fmt.Sprintf(
 					"snapshot created after applying the command at index %v",
 					m.CommandIndex)
