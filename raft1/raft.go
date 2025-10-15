@@ -46,13 +46,12 @@ type Raft struct {
 
 	state State
 
-	// Timers
 	timerMu         sync.Mutex
 	electionTimer   *time.Timer
 	heartbeatTicker *time.Ticker
 
-	applyChan  chan raftapi.ApplyMsg
-	commitCond *sync.Cond
+	applyChan         chan raftapi.ApplyMsg
+	signalApplierChan chan struct{}
 
 	// Persistent state:
 
@@ -221,7 +220,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.commitIdx = args.LastIncludedIndex
 	}
 
-	rf.commitCond.Broadcast()
+	rf.signalApplier()
 }
 
 func (rf *Raft) sendInstallSnapshotRPC(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -326,7 +325,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	rf.killCancel()
-	rf.commitCond.Broadcast()
 	rf.wg.Wait()
 }
 
@@ -385,7 +383,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 	if args.LeaderCommitIdx > rf.commitIdx {
 		lastLogIndex, _ := rf.lastLogIdxAndTerm()
 		rf.commitIdx = min(args.LeaderCommitIdx, lastLogIndex)
-		rf.commitCond.Broadcast()
+		rf.signalApplier()
 	}
 
 	reply.Success = true
@@ -621,7 +619,7 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 		lastCommitIdx := rf.commitIdx
 		rf.tryToCommit()
 		if rf.commitIdx != lastCommitIdx {
-			rf.commitCond.Broadcast()
+			rf.signalApplier()
 		}
 		return
 	}
@@ -661,7 +659,12 @@ func (rf *Raft) tryToCommit() {
 
 // ticker is the main state machine loop for a Raft peer
 func (rf *Raft) ticker() {
-	defer rf.wg.Done()
+	defer func() {
+		rf.heartbeatTicker.Stop()
+		rf.electionTimer.Stop()
+		rf.wg.Done()
+	}()
+
 	for {
 		select {
 		case <-rf.killCtx.Done():
@@ -681,59 +684,65 @@ func (rf *Raft) ticker() {
 	}
 }
 
+func (rf *Raft) signalApplier() {
+	select {
+	case rf.signalApplierChan <- struct{}{}:
+	default:
+	}
+}
+
 // applies committed log entries to the state machine in the background
 func (rf *Raft) applier() {
-	defer rf.wg.Done()
-	defer close(rf.applyChan)
+	defer func() {
+		close(rf.applyChan)
+		rf.wg.Done()
+	}()
 
 	for {
 		select {
 		case <-rf.killCtx.Done():
 			return
-		default:
-			rf.mu.Lock()
-			for rf.lastAppliedIdx >= rf.commitIdx && rf.lastAppliedIdx >= rf.lastIncludedIndex && !rf.killed() {
-				rf.commitCond.Wait()
-			}
+		case <-rf.signalApplierChan:
+			for {
+				rf.mu.RLock()
+				if rf.lastAppliedIdx >= rf.commitIdx || rf.killed() {
+					rf.mu.RUnlock()
+					break
+				}
 
-			if rf.killed() {
+				var msg raftapi.ApplyMsg
+				if rf.lastAppliedIdx < rf.lastIncludedIndex {
+					msg = raftapi.ApplyMsg{
+						SnapshotValid: true,
+						Snapshot:      rf.persister.ReadSnapshot(),
+						SnapshotTerm:  rf.lastIncludedTerm,
+						SnapshotIndex: rf.lastIncludedIndex,
+					}
+				} else {
+					applyIdx := rf.lastAppliedIdx + 1
+					sliceIdx := applyIdx - rf.lastIncludedIndex - 1
+					msg = raftapi.ApplyMsg{
+						CommandValid: true,
+						Command:      rf.log[sliceIdx].Cmd,
+						CommandIndex: applyIdx,
+					}
+				}
+				rf.mu.RUnlock()
+
+				select {
+				case <-rf.killCtx.Done():
+					return
+				case rf.applyChan <- msg:
+				}
+
+				rf.mu.Lock()
+				if msg.SnapshotValid {
+					rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
+				} else {
+					rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.CommandIndex)
+				}
 				rf.mu.Unlock()
-				return
 			}
-
-			var msg raftapi.ApplyMsg
-
-			if rf.lastAppliedIdx < rf.lastIncludedIndex {
-				msg = raftapi.ApplyMsg{
-					SnapshotValid: true,
-					Snapshot:      rf.persister.ReadSnapshot(),
-					SnapshotTerm:  rf.lastIncludedTerm,
-					SnapshotIndex: rf.lastIncludedIndex,
-				}
-			} else {
-				applyIdx := rf.lastAppliedIdx + 1
-				sliceIdx := applyIdx - rf.lastIncludedIndex - 1
-				msg = raftapi.ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[sliceIdx].Cmd,
-					CommandIndex: applyIdx,
-				}
-			}
-			rf.mu.Unlock()
-
-			select {
-			case <-rf.killCtx.Done():
-				return
-			case rf.applyChan <- msg:
-			}
-
-			rf.mu.Lock()
-			if msg.SnapshotValid {
-				rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.SnapshotIndex)
-			} else {
-				rf.lastAppliedIdx = max(rf.lastAppliedIdx, msg.CommandIndex)
-			}
-			rf.mu.Unlock()
 		}
 	}
 }
@@ -846,7 +855,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	ctx, cancel := context.WithCancel(context.Background())
 	rf.killCtx = ctx
 	rf.killCancel = cancel
-	rf.commitCond = sync.NewCond(&rf.mu)
+	rf.signalApplierChan = make(chan struct{}, 1)
 
 	atomic.StoreUint32(&rf.state, follower)
 	rf.log = make([]LogEntry, 0)
