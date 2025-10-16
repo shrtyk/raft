@@ -107,11 +107,11 @@ func (rf *Raft) getPersistentStateBytes() []byte {
 	return w.Bytes()
 }
 
-// unlockAndPersist captures the persistent state, locks the persister mutex,
+// persistAndUnlock captures the persistent state, locks the persister mutex,
 // unlocks the main mutex, and then persists the state
 //
 // It must be called with rf.mu held, and it will unlock it
-func (rf *Raft) unlockAndPersist(snapshot []byte) {
+func (rf *Raft) persistAndUnlock(snapshot []byte) {
 	state := rf.getPersistentStateBytes()
 	rf.persisterMu.Lock()
 	rf.mu.Unlock()
@@ -130,7 +130,7 @@ func (rf *Raft) unlockAndPersist(snapshot []byte) {
 // It must be called with rf.mu held, and it will unlock it
 func (rf *Raft) unlockConditionally(needToPersist bool, snapshot []byte) {
 	if needToPersist {
-		rf.unlockAndPersist(snapshot)
+		rf.persistAndUnlock(snapshot)
 	} else {
 		rf.mu.Unlock()
 	}
@@ -345,7 +345,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.matchIdx[rf.me] = lastLogIdx
 	rf.nextIdx[rf.me] = lastLogIdx + 1
 
-	rf.unlockAndPersist(nil)
+	rf.persistAndUnlock(nil)
 
 	go rf.sendAppendEntries()
 
@@ -411,8 +411,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppe
 		return
 	}
 
-	lastLogAbsIdx, _ := rf.lastLogIdxAndTerm()
-	if args.PrevLogIdx > lastLogAbsIdx || (args.PrevLogIdx >= rf.lastIncludedIndex && rf.getTerm(args.PrevLogIdx) != args.PrevLogTerm) {
+	if !rf.isLogConsistent(args.PrevLogIdx, args.PrevLogTerm) {
 		rf.fillConflictReply(args, reply)
 		return
 	}
@@ -458,6 +457,18 @@ func (rf *Raft) processEntries(args *RequestAppendEntriesArgs) (needToPersist bo
 // fillConflictReply sets the conflict fields in an AppendEntries reply
 //
 // Assumes the lock is held when called
+// isLogConsistent is a helper function that checks if the log is consistent
+// with the leader's AppendEntries request at a given index and term.
+//
+// Assumes the lock is held when called.
+func (rf *Raft) isLogConsistent(prevLogIdx int, prevLogTerm int) bool {
+	lastLogIdx, _ := rf.lastLogIdxAndTerm()
+	if prevLogIdx > lastLogIdx {
+		return false
+	}
+	return rf.getTerm(prevLogIdx) == prevLogTerm
+}
+
 func (rf *Raft) fillConflictReply(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	lastLogIdx, _ := rf.lastLogIdxAndTerm()
 	if args.PrevLogIdx > lastLogIdx {
@@ -484,7 +495,7 @@ func (rf *Raft) startElection() {
 	lastLogIdx, lastLogTerm := rf.lastLogIdxAndTerm()
 	currentTerm := rf.curTerm
 
-	rf.unlockAndPersist(nil)
+	rf.persistAndUnlock(nil)
 
 	repliesChan := make(chan *RequestVoteReply, len(rf.peers)-1)
 	args := &RequestVoteArgs{
@@ -668,24 +679,27 @@ func (rf *Raft) handleAppendEntriesReply(peerIdx int, args *RequestAppendEntries
 		return
 	}
 
-	if reply.ConflictTerm >= 0 {
-		lastIdxTerm := -1
-		lastLogIdx, _ := rf.lastLogIdxAndTerm()
-		for i := lastLogIdx; i > rf.lastIncludedIndex; i-- {
-			if rf.getTerm(i) == reply.ConflictTerm {
-				lastIdxTerm = i
-				break
-			}
-		}
+	rf.updateNextIndexAfterConflict(peerIdx, reply)
+}
 
-		if lastIdxTerm >= 0 {
-			rf.nextIdx[peerIdx] = lastIdxTerm + 1
-		} else {
-			rf.nextIdx[peerIdx] = reply.ConflictIdx
-		}
-	} else {
+// updateNextIndexAfterConflict is a helper function to update a follower's nextIdx
+// after a failed AppendEntries RPC
+//
+// Assumes the lock is held when called.
+func (rf *Raft) updateNextIndexAfterConflict(peerIdx int, reply *RequestAppendEntriesReply) {
+	if reply.ConflictTerm < 0 {
 		rf.nextIdx[peerIdx] = reply.ConflictIdx
+		return
 	}
+
+	lastLogIdx, _ := rf.lastLogIdxAndTerm()
+	for i := lastLogIdx; i > rf.lastIncludedIndex; i-- {
+		if rf.getTerm(i) == reply.ConflictTerm {
+			rf.nextIdx[peerIdx] = i + 1
+			return
+		}
+	}
+	rf.nextIdx[peerIdx] = reply.ConflictIdx
 }
 
 func (rf *Raft) tryToCommit() {
